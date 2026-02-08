@@ -445,6 +445,27 @@ async def get_room_participants(room_id: str):
 
 # ==================== PHOTO IMPORT ROUTES ====================
 
+def scan_local_folder_for_images(folder_path: str) -> List[str]:
+    """Recursively scan a folder for image files"""
+    image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.tiff', '.tif', '.svg'}
+    image_files = []
+    
+    try:
+        folder = Path(folder_path)
+        if not folder.exists():
+            return []
+        
+        # Recursively find all image files
+        for file_path in folder.rglob('*'):
+            if file_path.is_file() and file_path.suffix.lower() in image_extensions:
+                image_files.append(str(file_path))
+        
+        return sorted(image_files)
+    except Exception as e:
+        logger.error(f"Error scanning folder {folder_path}: {e}")
+        return []
+
+
 @api_router.post("/photos/import")
 async def import_photos(request: ImportPhotosRequest):
     """Import photos into a room"""
@@ -468,9 +489,15 @@ async def import_photos(request: ImportPhotosRequest):
         imported_count = 0
         
         if request.source_type == "local":
-            # Import from local paths
-            if not request.paths:
-                raise HTTPException(status_code=400, detail="Paths required for local import")
+            # Import from local folder
+            if not request.folder_path:
+                raise HTTPException(status_code=400, detail="Folder path required for local import")
+            
+            # Scan folder recursively for images
+            image_paths = scan_local_folder_for_images(request.folder_path)
+            
+            if not image_paths:
+                raise HTTPException(status_code=400, detail="No image files found in the specified folder")
             
             # Get current max index
             max_photo = await db.photos.find_one(
@@ -479,7 +506,7 @@ async def import_photos(request: ImportPhotosRequest):
             )
             current_index = max_photo["index"] + 1 if max_photo else 0
             
-            for path in request.paths:
+            for path in image_paths:
                 photo_dict = {
                     "room_id": request.room_id,
                     "source_type": "local",
@@ -499,6 +526,9 @@ async def import_photos(request: ImportPhotosRequest):
             
             drive_service = GoogleDriveService(request.drive_access_token)
             files = drive_service.list_images_in_folder(request.drive_folder_id)
+            
+            if not files:
+                raise HTTPException(status_code=400, detail="No image files found in the Drive folder")
             
             # Get current max index
             max_photo = await db.photos.find_one(
