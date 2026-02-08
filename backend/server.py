@@ -473,8 +473,12 @@ async def upload_photos(
     files: List[UploadFile] = File(...)
 ):
     """Upload photos directly from client"""
+    logger.info(f"Upload request received for room: {room_id}")
+    logger.info(f"Number of files: {len(files) if files else 0}")
+    
     room = await db.rooms.find_one({"_id": ObjectId(room_id)})
     if not room:
+        logger.error(f"Room not found: {room_id}")
         raise HTTPException(status_code=404, detail="Room not found")
     
     # Create import job
