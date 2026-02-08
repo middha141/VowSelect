@@ -152,7 +152,7 @@ export default function Index() {
         {currentUser && (
           <View style={styles.userInfo}>
             <Text style={styles.userText}>👤 {currentUser.username}</Text>
-            <TouchableOpacity onPress={() => setShowUsernameInput(true)}>
+            <TouchableOpacity onPress={handleSwitchUser}>
               <Text style={styles.switchText}>Switch User</Text>
             </TouchableOpacity>
           </View>
