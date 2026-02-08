@@ -42,7 +42,7 @@ export default function SwipeScreen() {
       const user = await getCurrentUser();
       setCurrentUser(user);
 
-      const photosData = await getRoomPhotos(roomId as string, 0, 500);
+      const photosData = await getRoomPhotos(roomId as string, 0, 100);
       setPhotos(photosData.photos);
 
       // Get user's votes to determine starting point
