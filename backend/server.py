@@ -89,10 +89,11 @@ class RoomParticipant(BaseModel):
 class Photo(BaseModel):
     id: Optional[str] = Field(None, alias="_id")
     room_id: str
-    source_type: str  # "local" or "drive"
+    source_type: str  # "local", "drive", or "upload"
     path: Optional[str] = None  # For local files
     drive_id: Optional[str] = None  # For Google Drive files
     drive_thumbnail_url: Optional[str] = None
+    base64_data: Optional[str] = None  # For uploaded files
     filename: str
     index: int  # Order in the room
     created_at: datetime = Field(default_factory=datetime.utcnow)
