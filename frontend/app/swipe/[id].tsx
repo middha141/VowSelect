@@ -294,6 +294,13 @@ export default function SwipeScreen() {
           ) : (
             renderPlaceholderImage()
           )}
+          
+          {/* Current Score Badge */}
+          {hasVoted && (
+            <View style={styles.currentScoreBadge}>
+              <Text style={styles.currentScoreText}>Current Score: {currentScore > 0 ? '+' : ''}{currentScore}</Text>
+            </View>
+          )}
 
           {/* Swipe indicators */}
           {swiping && (
