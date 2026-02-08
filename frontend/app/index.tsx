@@ -33,6 +33,11 @@ export default function Index() {
     }
   };
 
+  const handleSwitchUser = () => {
+    setShowUsernameInput(true);
+    setUsername(''); // Clear the username field
+  };
+
   const handleSetUsername = async () => {
     if (!username.trim()) {
       Alert.alert('Error', 'Please enter a username');
