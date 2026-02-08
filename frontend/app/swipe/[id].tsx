@@ -214,7 +214,7 @@ export default function SwipeScreen() {
   }
 
   const currentPhoto = photos[currentIndex];
-  const rotate = position.x.interpolate(({
+  const rotate = position.x.interpolate({
     inputRange: [-SCREEN_WIDTH / 2, 0, SCREEN_WIDTH / 2],
     outputRange: ['-10deg', '0deg', '10deg'],
     extrapolate: 'clamp',
