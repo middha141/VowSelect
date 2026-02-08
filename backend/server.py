@@ -161,7 +161,7 @@ class JoinRoomRequest(BaseModel):
 class ImportPhotosRequest(BaseModel):
     room_id: str
     source_type: str
-    paths: Optional[List[str]] = None  # For local
+    folder_path: Optional[str] = None  # For local folder
     drive_folder_id: Optional[str] = None  # For Google Drive
     drive_access_token: Optional[str] = None
 
