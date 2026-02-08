@@ -129,29 +129,50 @@ export default function RankingsScreen() {
           </View>
         ) : (
           <View style={styles.rankingsList}>
-            {rankings.map((photo, index) => (
-              <View key={photo.photo_id} style={styles.rankingItem}>
-                <View style={styles.rankBadge}>
-                  <Text style={styles.rankText}>#{photo.rank}</Text>
+            {rankings.map((photo, index) => {
+              const fullPhoto = photosMap.get(photo.photo_id);
+              return (
+                <View key={photo.photo_id} style={styles.rankingItem}>
+                  <View style={styles.rankBadge}>
+                    <Text style={styles.rankText}>#{photo.rank}</Text>
+                  </View>
+                  
+                  {/* Photo Thumbnail */}
+                  {fullPhoto?.base64_data ? (
+                    <Image
+                      source={{ uri: `data:image/jpeg;base64,${fullPhoto.base64_data}` }}
+                      style={styles.photoThumbnail}
+                    />
+                  ) : fullPhoto?.drive_thumbnail_url ? (
+                    <Image
+                      source={{ uri: fullPhoto.drive_thumbnail_url }}
+                      style={styles.photoThumbnail}
+                    />
+                  ) : (
+                    <View style={styles.photoPlaceholder}>
+                      <Text style={styles.placeholderIcon}>📷</Text>
+                    </View>
+                  )}
+                  
+                  <View style={styles.photoInfo}>
+                    <Text style={styles.photoName} numberOfLines={1}>
+                      {photo.filename}
+                    </Text>
+                    <Text style={styles.photoSource}>
+                      {photo.source_type === 'local' ? '💾 Local' : photo.source_type === 'upload' ? '📤 Upload' : '☁️ Drive'}
+                    </Text>
+                  </View>
+                  <View style={styles.scoreInfo}>
+                    <Text style={styles.scoreValue}>
+                      {photo.weighted_score.toFixed(2)}
+                    </Text>
+                    <Text style={styles.voteCount}>
+                      {photo.vote_count} vote{photo.vote_count !== 1 ? 's' : ''}
+                    </Text>
+                  </View>
                 </View>
-                <View style={styles.photoInfo}>
-                  <Text style={styles.photoName} numberOfLines={1}>
-                    {photo.filename}
-                  </Text>
-                  <Text style={styles.photoSource}>
-                    {photo.source_type === 'local' ? '💾 Local' : '☁️ Drive'}
-                  </Text>
-                </View>
-                <View style={styles.scoreInfo}>
-                  <Text style={styles.scoreValue}>
-                    {photo.weighted_score.toFixed(2)}
-                  </Text>
-                  <Text style={styles.voteCount}>
-                    {photo.vote_count} vote{photo.vote_count !== 1 ? 's' : ''}
-                  </Text>
-                </View>
-              </View>
-            ))}
+              );
+            })}
           </View>
         )}
       </ScrollView>
