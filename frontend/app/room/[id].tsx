@@ -67,7 +67,7 @@ export default function RoomScreen() {
       const result = await DocumentPicker.getDocumentAsync({
         type: 'image/*',
         multiple: true,
-        copyToCacheDirectory: true,
+        copyToCacheDirectory: false,
       });
 
       console.log('DocumentPicker result:', result);
@@ -87,29 +87,56 @@ export default function RoomScreen() {
 
       console.log(`Selected ${files.length} files`);
 
-      // Upload files using FormData
-      const formData = new FormData();
+      // Convert files to base64 and send as JSON
+      const photoData = [];
       
       for (const file of files) {
-        console.log('Processing file:', file.name, file.uri);
-        // Create file object for upload
-        const fileObj: any = {
-          uri: file.uri,
-          type: file.mimeType || 'image/jpeg',
-          name: file.name,
-        };
-        formData.append('files', fileObj);
+        try {
+          console.log('Reading file:', file.name, file.uri);
+          
+          // Read file as base64
+          const response = await fetch(file.uri);
+          const blob = await response.blob();
+          const reader = new FileReader();
+          
+          const base64 = await new Promise<string>((resolve, reject) => {
+            reader.onloadend = () => {
+              const result = reader.result as string;
+              // Remove data:image/xxx;base64, prefix
+              const base64Data = result.split(',')[1];
+              resolve(base64Data);
+            };
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+          });
+          
+          photoData.push({
+            filename: file.name,
+            base64_data: base64,
+          });
+        } catch (err) {
+          console.error('Error reading file:', file.name, err);
+        }
       }
 
+      if (photoData.length === 0) {
+        Alert.alert('Error', 'Failed to read any files');
+        setImporting(false);
+        return;
+      }
+
+      console.log(`Uploading ${photoData.length} photos`);
+
       const API_URL = process.env.EXPO_PUBLIC_BACKEND_URL + '/api';
-      console.log('Uploading to:', `${API_URL}/photos/upload?room_id=${roomId}`);
-      
       const uploadResponse = await axios.post(
-        `${API_URL}/photos/upload?room_id=${roomId}`,
-        formData,
+        `${API_URL}/photos/upload-json`,
+        {
+          room_id: roomId,
+          photos: photoData,
+        },
         {
           headers: {
-            'Content-Type': 'multipart/form-data',
+            'Content-Type': 'application/json',
           },
         }
       );
