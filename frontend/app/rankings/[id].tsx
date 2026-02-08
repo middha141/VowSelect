@@ -22,6 +22,7 @@ export default function RankingsScreen() {
   const roomId = Array.isArray(id) ? id[0] : id;
 
   const [rankings, setRankings] = useState<PhotoRanking[]>([]);
+  const [photosMap, setPhotosMap] = useState<Map<string, Photo>>(new Map());
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
@@ -37,6 +38,11 @@ export default function RankingsScreen() {
     try {
       const data = await getRankings(roomId as string);
       setRankings(data);
+      
+      // Also fetch full photo data to get base64
+      const photosData = await getRoomPhotos(roomId as string, 0, 100);
+      const photoMap = new Map(photosData.photos.map((p: Photo) => [p._id || p.id || '', p]));
+      setPhotosMap(photoMap);
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to load rankings');
     } finally {
