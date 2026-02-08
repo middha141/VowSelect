@@ -10,8 +10,10 @@ import {
   TextInput,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
+import * as DocumentPicker from 'expo-document-picker';
 import { getRoom, getRoomParticipants, importPhotos, getCurrentUser } from '../../services/api';
 import { Room as RoomType, RoomParticipant } from '../../types';
+import axios from 'axios';
 
 export default function RoomScreen() {
   const { id } = useLocalSearchParams();
