@@ -359,6 +359,22 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#D946B2',
   },
+  photoThumbnail: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+  },
+  photoPlaceholder: {
+    width: 60,
+    height: 60,
+    borderRadius: 8,
+    backgroundColor: '#F3F4F6',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  placeholderIcon: {
+    fontSize: 24,
+  },
   photoInfo: {
     flex: 1,
   },
