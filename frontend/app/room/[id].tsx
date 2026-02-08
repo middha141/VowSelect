@@ -358,6 +358,12 @@ const styles = StyleSheet.create({
     minHeight: 100,
     textAlignVertical: 'top',
   },
+  helperText: {
+    fontSize: 12,
+    color: '#666',
+    marginBottom: 12,
+    fontStyle: 'italic',
+  },
   importButton: {
     backgroundColor: '#EC4899',
     borderRadius: 12,
