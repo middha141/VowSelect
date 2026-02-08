@@ -215,14 +215,7 @@ export default function RoomScreen() {
         <Text style={styles.sectionTitle}>📥 Import Photos</Text>
 
         <Text style={styles.importLabel}>Local Files</Text>
-        <TextInput
-          style={styles.input}
-          placeholder="Enter folder path (e.g., /photos/wedding)"
-          value={localFolderPath}
-          onChangeText={setLocalFolderPath}
-          placeholderTextColor="#999"
-        />
-        <Text style={styles.helperText}>📁 Will scan folder recursively for all image files</Text>
+        <Text style={styles.helperText}>📁 Select multiple photos from your device</Text>
         <TouchableOpacity
           style={[styles.importButton, importing && styles.buttonDisabled]}
           onPress={handleImportLocal}
@@ -231,7 +224,7 @@ export default function RoomScreen() {
           {importing ? (
             <ActivityIndicator color="#fff" />
           ) : (
-            <Text style={styles.importButtonText}>Import Local Photos</Text>
+            <Text style={styles.importButtonText}>📷 Select & Upload Photos</Text>
           )}
         </TouchableOpacity>
 
