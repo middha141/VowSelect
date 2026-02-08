@@ -50,6 +50,10 @@ export default function SwipeScreen() {
       const votesData = await getUserVotes(roomId as string, user.userId);
       const votedPhotoIds = new Set(votesData.votes.map((v: any) => v.photo_id));
       setVotedPhotos(votedPhotoIds);
+      
+      // Create a map of photo_id -> score for quick lookup
+      const votesMap = new Map(votesData.votes.map((v: any) => [v.photo_id, v.score]));
+      setUserVotesMap(votesMap);
 
       // Find first unvoted photo
       const firstUnvotedIndex = photosData.photos.findIndex(
