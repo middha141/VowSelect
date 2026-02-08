@@ -58,26 +58,25 @@ export default function RoomScreen() {
   };
 
   const handleImportLocal = async () => {
-    if (!localPaths.trim()) {
-      Alert.alert('Error', 'Please enter image paths (one per line)');
+    if (!localFolderPath.trim()) {
+      Alert.alert('Error', 'Please enter a folder path');
       return;
     }
 
     try {
       setImporting(true);
-      const paths = localPaths.split('\n').map(p => p.trim()).filter(p => p);
       
       const result = await importPhotos({
         room_id: roomId as string,
         source_type: 'local',
-        paths,
+        folder_path: localFolderPath.trim(),
       });
 
-      Alert.alert('Success', `Imported ${result.imported_count} photos`);
-      setLocalPaths('');
+      Alert.alert('Success', `Imported ${result.imported_count} photos from folder`);
+      setLocalFolderPath('');
       loadRoomData();
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to import photos');
+      Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to import photos');
     } finally {
       setImporting(false);
     }
