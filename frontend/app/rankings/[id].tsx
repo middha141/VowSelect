@@ -9,10 +9,12 @@ import {
   ActivityIndicator,
   TextInput,
   Modal,
+  Image,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { getRankings, exportPhotos } from '../../services/api';
-import { PhotoRanking } from '../../types';
+import * as DocumentPicker from 'expo-document-picker';
+import { getRankings, exportPhotos, getRoomPhotos } from '../../services/api';
+import { PhotoRanking, Photo } from '../../types';
 
 export default function RankingsScreen() {
   const { id } = useLocalSearchParams();
