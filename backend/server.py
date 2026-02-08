@@ -467,6 +467,84 @@ def scan_local_folder_for_images(folder_path: str) -> List[str]:
         return []
 
 
+class UploadPhotosRequest(BaseModel):
+    room_id: str
+    photos: List[Dict[str, str]]  # List of {filename, base64_data}
+
+
+@api_router.post("/photos/upload-json")
+async def upload_photos_json(request: UploadPhotosRequest):
+    """Upload photos as JSON with base64 data"""
+    logger.info(f"JSON upload request received for room: {request.room_id}")
+    logger.info(f"Number of photos: {len(request.photos)}")
+    
+    room = await db.rooms.find_one({"_id": ObjectId(request.room_id)})
+    if not room:
+        logger.error(f"Room not found: {request.room_id}")
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    # Create import job
+    job_dict = {
+        "room_id": request.room_id,
+        "source_type": "upload",
+        "status": "processing",
+        "total_photos": 0,
+        "processed_photos": 0,
+        "created_at": datetime.utcnow()
+    }
+    job_result = await db.import_jobs.insert_one(job_dict)
+    job_id = str(job_result.inserted_id)
+    
+    try:
+        imported_count = 0
+        
+        # Get current max index
+        max_photo = await db.photos.find_one(
+            {"room_id": request.room_id},
+            sort=[("index", -1)]
+        )
+        current_index = max_photo["index"] + 1 if max_photo else 0
+        
+        for photo_data in request.photos:
+            # Store photo with base64 data
+            photo_dict = {
+                "room_id": request.room_id,
+                "source_type": "upload",
+                "filename": photo_data["filename"],
+                "base64_data": photo_data["base64_data"],
+                "index": current_index,
+                "created_at": datetime.utcnow()
+            }
+            await db.photos.insert_one(photo_dict)
+            imported_count += 1
+            current_index += 1
+        
+        # Update job status
+        await db.import_jobs.update_one(
+            {"_id": ObjectId(job_id)},
+            {"$set": {
+                "status": "completed",
+                "total_photos": imported_count,
+                "processed_photos": imported_count
+            }}
+        )
+        
+        logger.info(f"Successfully uploaded {imported_count} photos")
+        return {
+            "job_id": job_id,
+            "status": "completed",
+            "imported_count": imported_count
+        }
+    
+    except Exception as e:
+        logger.error(f"Error uploading photos: {e}")
+        await db.import_jobs.update_one(
+            {"_id": ObjectId(job_id)},
+            {"$set": {"status": "failed"}}
+        )
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @api_router.post("/photos/upload")
 async def upload_photos(
     room_id: str = Query(...),
