@@ -99,7 +99,7 @@ export default function Index() {
     }
   };
 
-  if (showUsernameInput && !currentUser) {
+  if (showUsernameInput) {
     return (
       <KeyboardAvoidingView
         style={styles.container}
@@ -128,7 +128,10 @@ export default function Index() {
 
           <TouchableOpacity
             style={styles.linkButton}
-            onPress={() => setShowUsernameInput(false)}
+            onPress={() => {
+              setShowUsernameInput(false);
+              setUsername(currentUser?.username || '');
+            }}
           >
             <Text style={styles.linkText}>Back</Text>
           </TouchableOpacity>
