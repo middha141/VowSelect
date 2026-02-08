@@ -28,6 +28,7 @@ export default function SwipeScreen() {
   const [loading, setLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [votedPhotos, setVotedPhotos] = useState<Set<string>>(new Set());
+  const [userVotesMap, setUserVotesMap] = useState<Map<string, number>>(new Map());
   const [showScoreButtons, setShowScoreButtons] = useState<'left' | 'right' | null>(null);
 
   const position = useRef(new Animated.ValueXY()).current;
