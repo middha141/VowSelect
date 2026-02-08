@@ -70,7 +70,10 @@ export default function RoomScreen() {
         copyToCacheDirectory: true,
       });
 
+      console.log('DocumentPicker result:', result);
+
       if (result.canceled) {
+        console.log('User canceled picker');
         setImporting(false);
         return;
       }
@@ -82,10 +85,13 @@ export default function RoomScreen() {
         return;
       }
 
+      console.log(`Selected ${files.length} files`);
+
       // Upload files using FormData
       const formData = new FormData();
       
       for (const file of files) {
+        console.log('Processing file:', file.name, file.uri);
         // Create file object for upload
         const fileObj: any = {
           uri: file.uri,
@@ -96,6 +102,8 @@ export default function RoomScreen() {
       }
 
       const API_URL = process.env.EXPO_PUBLIC_BACKEND_URL + '/api';
+      console.log('Uploading to:', `${API_URL}/photos/upload?room_id=${roomId}`);
+      
       const uploadResponse = await axios.post(
         `${API_URL}/photos/upload?room_id=${roomId}`,
         formData,
@@ -106,10 +114,12 @@ export default function RoomScreen() {
         }
       );
 
+      console.log('Upload response:', uploadResponse.data);
       Alert.alert('Success', `Uploaded ${uploadResponse.data.imported_count} photos!`);
       loadRoomData();
     } catch (error: any) {
       console.error('Upload error:', error);
+      console.error('Error response:', error.response?.data);
       Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to upload photos');
     } finally {
       setImporting(false);
