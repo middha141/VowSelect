@@ -48,7 +48,7 @@ export const getRoomParticipants = async (roomId: string) => {
 export const importPhotos = async (data: {
   room_id: string;
   source_type: 'local' | 'drive';
-  paths?: string[];
+  folder_path?: string;
   drive_folder_id?: string;
   drive_access_token?: string;
 }) => {
