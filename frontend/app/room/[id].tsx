@@ -60,25 +60,57 @@ export default function RoomScreen() {
   };
 
   const handleImportLocal = async () => {
-    if (!localFolderPath.trim()) {
-      Alert.alert('Error', 'Please enter a folder path');
-      return;
-    }
-
     try {
       setImporting(true);
       
-      const result = await importPhotos({
-        room_id: roomId as string,
-        source_type: 'local',
-        folder_path: localFolderPath.trim(),
+      // Pick multiple images
+      const result = await DocumentPicker.getDocumentAsync({
+        type: 'image/*',
+        multiple: true,
+        copyToCacheDirectory: true,
       });
 
-      Alert.alert('Success', `Imported ${result.imported_count} photos from folder`);
-      setLocalFolderPath('');
+      if (result.canceled) {
+        setImporting(false);
+        return;
+      }
+
+      const files = result.assets;
+      if (!files || files.length === 0) {
+        Alert.alert('Error', 'No files selected');
+        setImporting(false);
+        return;
+      }
+
+      // Upload files using FormData
+      const formData = new FormData();
+      
+      for (const file of files) {
+        // Create file object for upload
+        const fileObj: any = {
+          uri: file.uri,
+          type: file.mimeType || 'image/jpeg',
+          name: file.name,
+        };
+        formData.append('files', fileObj);
+      }
+
+      const API_URL = process.env.EXPO_PUBLIC_BACKEND_URL + '/api';
+      const uploadResponse = await axios.post(
+        `${API_URL}/photos/upload?room_id=${roomId}`,
+        formData,
+        {
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        }
+      );
+
+      Alert.alert('Success', `Uploaded ${uploadResponse.data.imported_count} photos!`);
       loadRoomData();
     } catch (error: any) {
-      Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to import photos');
+      console.error('Upload error:', error);
+      Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to upload photos');
     } finally {
       setImporting(false);
     }
