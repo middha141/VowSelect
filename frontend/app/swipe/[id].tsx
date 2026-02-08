@@ -215,15 +215,28 @@ export default function SwipeScreen() {
     extrapolate: 'clamp',
   });
 
-  const renderPlaceholderImage = () => (
-    <View style={styles.placeholderImage}>
-      <Text style={styles.placeholderText}>📸</Text>
-      <Text style={styles.placeholderFilename}>{currentPhoto.filename}</Text>
-      <Text style={styles.placeholderSource}>
-        {currentPhoto.source_type === 'local' ? '💾 Local' : '☁️ Drive'}
-      </Text>
-    </View>
-  );
+  const renderPlaceholderImage = () => {
+    // Check if photo has base64 data (uploaded photo)
+    if (currentPhoto.base64_data) {
+      return (
+        <Image
+          source={{ uri: `data:image/jpeg;base64,${currentPhoto.base64_data}` }}
+          style={styles.photoImage}
+        />
+      );
+    }
+    
+    // Otherwise show placeholder
+    return (
+      <View style={styles.placeholderImage}>
+        <Text style={styles.placeholderText}>📸</Text>
+        <Text style={styles.placeholderFilename}>{currentPhoto.filename}</Text>
+        <Text style={styles.placeholderSource}>
+          {currentPhoto.source_type === 'local' ? '💾 Local' : currentPhoto.source_type === 'upload' ? '📤 Uploaded' : '☁️ Drive'}
+        </Text>
+      </View>
+    );
+  };
 
   return (
     <View style={styles.container}>
