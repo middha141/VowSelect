@@ -24,7 +24,7 @@ export default function RoomScreen() {
   const [currentUser, setCurrentUser] = useState<any>(null);
 
   // Local import
-  const [localPaths, setLocalPaths] = useState('');
+  const [localFolderPath, setLocalFolderPath] = useState('');
 
   // Google Drive import
   const [driveFolderId, setDriveFolderId] = useState('');
