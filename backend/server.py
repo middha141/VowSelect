@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.server_api import ServerApi
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from datetime import datetime
@@ -14,6 +15,9 @@ import string
 import io
 from bson import ObjectId
 
+# Database initialization
+from database.init_db import DatabaseInitializer
+
 # Google Drive imports
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -22,10 +26,13 @@ from google.oauth2.credentials import Credentials
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# MongoDB connection
+# MongoDB connection - initialized on app startup
 mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+db_name = os.environ['DB_NAME']
+print(f"MongoDB URL: {mongo_url}")
+print(f"Database name: {db_name}")
+client = None
+db = None
 
 # Create the main app
 app = FastAPI(title="VowSelect API")
@@ -932,6 +939,38 @@ app.add_middleware(
 )
 
 
+@app.on_event("startup")
+async def startup_db_client():
+    global client, db
+    logger.info(f"Connecting to MongoDB Atlas...")
+    print(f"Connecting to MongoDB Atlas...", flush=True)
+    try:
+        print(f"MongoDB URL: {mongo_url}", flush=True)
+        print(f"Database name: {db_name}", flush=True)
+        client = AsyncIOMotorClient(mongo_url, server_api=ServerApi('1'), serverSelectionTimeoutMS=5000)
+        print(f"Client created", flush=True)
+        # Verify connection
+        await client.admin.command('ping')
+        print(f"Ping successful", flush=True)
+        db = client[db_name]
+        logger.info("✓ MongoDB connection established")
+        print("✓ MongoDB connection established", flush=True)
+        
+        # Initialize database collections
+        initializer = DatabaseInitializer(db)
+        await initializer.initialize()
+        logger.info("✓ Database collections initialized")
+        print("✓ Database collections initialized", flush=True)
+    except Exception as e:
+        logger.error(f"✗ Failed to connect to MongoDB: {e}")
+        print(f"✗ Failed to connect to MongoDB: {e}", flush=True)
+        raise
+
+
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    global client
+    if client:
+        client.close()
+        logger.info("MongoDB connection closed")
+
