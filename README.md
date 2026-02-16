@@ -51,7 +51,21 @@ A collaborative wedding photo selection app with Tinder-style swipe interface an
 
 ---
 
-## 📦 Installation Guide
+## � Documentation & Guides
+
+Detailed guides are available in the [guides/](guides/) folder:
+
+### Start Here
+- [QUICKSTART.md](guides/QUICKSTART.md) - Quick setup and first run
+
+### Comprehensive Guides
+- [MONGODB_GUIDE.md](guides/MONGODB_GUIDE.md) - Complete MongoDB reference with schemas, setup, and best practices
+- [GOOGLE_DRIVE_GUIDE.md](guides/GOOGLE_DRIVE_GUIDE.md) - Full Google Drive integration guide (public & private folders, OAuth, code examples)
+- [DATABASE_INTEGRATION.md](guides/DATABASE_INTEGRATION.md) - Database initialization and FastAPI integration
+
+---
+
+## �📦 Installation Guide
 
 ### Step 1: Install Node.js (if not already installed)
 
