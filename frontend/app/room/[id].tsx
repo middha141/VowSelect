@@ -1,3 +1,4 @@
+/** @jsxRuntime automatic */
 import React, { useState, useEffect } from 'react';
 import {
   View,
@@ -8,12 +9,15 @@ import {
   ScrollView,
   ActivityIndicator,
   TextInput,
+  Linking,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
+import * as WebBrowser from 'expo-web-browser';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import * as DocumentPicker from 'expo-document-picker';
-import { getRoom, getRoomParticipants, importPhotos, getCurrentUser } from '../../services/api';
+import { getRoom, getRoomParticipants, importPhotos, getCurrentUser, getImportJobStatus } from '../../services/api';
 import { Room as RoomType, RoomParticipant } from '../../types';
-import axios from 'axios';
 
 export default function RoomScreen() {
   const { id } = useLocalSearchParams();
@@ -29,19 +33,110 @@ export default function RoomScreen() {
   const [localFolderPath, setLocalFolderPath] = useState('');
 
   // Google Drive import
-  const [driveFolderId, setDriveFolderId] = useState('');
-  const [driveAccessToken, setDriveAccessToken] = useState('');
+  const [driveFolderUrl, setDriveFolderUrl] = useState('');
+  const [driveAccessToken, setDriveAccessToken] = useState<string | null>(null);
+
+  // Import progress tracking
+  const [importJobId, setImportJobId] = useState<string | null>(null);
+  const [importProgress, setImportProgress] = useState<{
+    status: string;
+    processed: number;
+    total: number;
+    ready: number;
+    failed?: number;
+  } | null>(null);
+  const [expectedTotal, setExpectedTotal] = useState<number | null>(null);
 
   const roomId = Array.isArray(id) ? id[0] : id;
 
   useEffect(() => {
     loadRoomData();
     loadUser();
+    loadDriveToken();
   }, []);
+
+  // Check for token when returning from OAuth (mobile deep link)
+  useEffect(() => {
+    const checkForNewToken = setInterval(() => {
+      loadDriveToken();
+    }, 1000);
+
+    return () => clearInterval(checkForNewToken);
+  }, []);
+
+  // Auto-refresh room data every 5s when an import is active (covers returning to page mid-import)
+  useEffect(() => {
+    if (!importing && !importJobId) return;
+
+    const interval = setInterval(() => {
+      loadRoomData();
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, [importing, importJobId]);
+
+  useEffect(() => {
+    console.log('driveAccessToken changed:', driveAccessToken ? 'Token present (length: ' + driveAccessToken.length + ')' : 'No token');
+  }, [driveAccessToken]);
+
+  // Poll import job progress when a background import is running
+  useEffect(() => {
+    if (!importJobId) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const data = await getImportJobStatus(importJobId);
+        const job = data.job;
+        const ready = data.ready_photo_count ?? 0;
+
+        setImportProgress({
+          status: job.status,
+          processed: job.processed_photos ?? 0,
+          total: job.total_photos ?? 0,
+          ready,
+          failed: job.failed_photos ?? 0,
+        });
+
+        // Refresh photo count in the room header
+        setPhotoCount(ready);
+
+        if (job.status === 'completed' || job.status === 'failed') {
+          clearInterval(interval);
+          setImportJobId(null);
+          setImporting(false);
+          setExpectedTotal(null);
+          setImportProgress(null);
+          loadRoomData();
+
+          if (job.status === 'completed') {
+            Alert.alert('Import Complete', `All ${job.processed_photos} photos are ready!`);
+          } else {
+            Alert.alert('Import Issue', `Imported ${job.processed_photos} photos. ${job.failed_photos ?? 0} failed.`);
+          }
+        }
+      } catch (err) {
+        console.error('Polling error:', err);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [importJobId]);
 
   const loadUser = async () => {
     const user = await getCurrentUser();
     setCurrentUser(user);
+  };
+
+  const loadDriveToken = async () => {
+    try {
+      const token = await AsyncStorage.getItem('driveAccessToken');
+      if (token && token !== driveAccessToken) {
+        console.log('Drive token loaded from AsyncStorage');
+        setDriveAccessToken(token);
+      }
+    } catch (error) {
+      console.error('Failed to load Drive token:', error);
+    }
   };
 
   const loadRoomData = async () => {
@@ -49,6 +144,27 @@ export default function RoomScreen() {
       const data = await getRoom(roomId as string);
       setRoom(data.room);
       setPhotoCount(data.photo_count);
+
+      // If there's an active import job, resume polling
+      if (data.importing && data.import_job) {
+        const job = data.import_job;
+        setExpectedTotal(job.total_photos);
+
+        // Resume polling if we don't already have one running
+        if (!importJobId) {
+          setImportJobId(job.job_id);
+          setImporting(true);
+          setImportProgress({
+            status: job.status,
+            processed: job.processed_photos ?? 0,
+            total: job.total_photos ?? 0,
+            ready: data.photo_count,
+            failed: job.failed_photos ?? 0,
+          });
+        }
+      } else {
+        setExpectedTotal(null);
+      }
 
       const participantsData = await getRoomParticipants(roomId as string);
       setParticipants(participantsData.participants);
@@ -59,108 +175,20 @@ export default function RoomScreen() {
     }
   };
 
-  const handleImportLocal = async () => {
+  const handleGoogleSignOut = async () => {
     try {
-      setImporting(true);
-      
-      // Pick multiple images
-      const result = await DocumentPicker.getDocumentAsync({
-        type: 'image/*',
-        multiple: true,
-        copyToCacheDirectory: false,
-      });
-
-      console.log('DocumentPicker result:', result);
-
-      if (result.canceled) {
-        console.log('User canceled picker');
-        setImporting(false);
-        return;
-      }
-
-      const files = result.assets;
-      if (!files || files.length === 0) {
-        Alert.alert('Error', 'No files selected');
-        setImporting(false);
-        return;
-      }
-
-      console.log(`Selected ${files.length} files`);
-
-      // Convert files to base64 and send as JSON
-      const photoData = [];
-      
-      for (const file of files) {
-        try {
-          console.log('Reading file:', file.name, file.uri);
-          
-          // Read file as base64
-          const response = await fetch(file.uri);
-          const blob = await response.blob();
-          const reader = new FileReader();
-          
-          const base64 = await new Promise<string>((resolve, reject) => {
-            reader.onloadend = () => {
-              const result = reader.result as string;
-              // Remove data:image/xxx;base64, prefix
-              const base64Data = result.split(',')[1];
-              resolve(base64Data);
-            };
-            reader.onerror = reject;
-            reader.readAsDataURL(blob);
-          });
-          
-          photoData.push({
-            filename: file.name,
-            base64_data: base64,
-          });
-        } catch (err) {
-          console.error('Error reading file:', file.name, err);
-        }
-      }
-
-      if (photoData.length === 0) {
-        Alert.alert('Error', 'Failed to read any files');
-        setImporting(false);
-        return;
-      }
-
-      console.log(`Uploading ${photoData.length} photos`);
-
-      const API_URL = process.env.EXPO_PUBLIC_BACKEND_URL + '/api';
-      const uploadResponse = await axios.post(
-        `${API_URL}/photos/upload-json`,
-        {
-          room_id: roomId,
-          photos: photoData,
-        },
-        {
-          headers: {
-            'Content-Type': 'application/json',
-          },
-        }
-      );
-
-      console.log('Upload response:', uploadResponse.data);
-      Alert.alert('Success', `Uploaded ${uploadResponse.data.imported_count} photos!`);
-      loadRoomData();
-    } catch (error: any) {
-      console.error('Upload error:', error);
-      console.error('Error response:', error.response?.data);
-      Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to upload photos');
-    } finally {
-      setImporting(false);
+      await AsyncStorage.removeItem('driveAccessToken');
+      setDriveAccessToken(null);
+      Alert.alert('Signed Out', 'You have been signed out of Google Drive');
+    } catch (error) {
+      console.error('Failed to sign out:', error);
+      Alert.alert('Error', 'Failed to sign out');
     }
   };
 
-  const handleImportDrive = async () => {
-    if (!driveFolderId.trim()) {
-      Alert.alert('Error', 'Please enter Google Drive folder ID');
-      return;
-    }
-
-    if (!driveAccessToken.trim()) {
-      Alert.alert('Error', 'Please enter Google Drive access token');
+  const handleImportLocal = async () => {
+    if (!localFolderPath.trim()) {
+      Alert.alert('Error', 'Please enter a folder path');
       return;
     }
 
@@ -169,20 +197,204 @@ export default function RoomScreen() {
       
       const result = await importPhotos({
         room_id: roomId as string,
-        source_type: 'drive',
-        drive_folder_id: driveFolderId.trim(),
-        drive_access_token: driveAccessToken.trim(),
+        source_type: 'local',
+        folder_path: localFolderPath.trim(),
       });
 
-      Alert.alert('Success', `Imported ${result.imported_count} photos from Google Drive`);
-      setDriveFolderId('');
-      setDriveAccessToken('');
+      Alert.alert('Success', `Imported ${result.imported_count} photos from local folder`);
+      setLocalFolderPath('');
       loadRoomData();
     } catch (error: any) {
-      Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to import from Drive');
+      Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to import from local folder');
     } finally {
       setImporting(false);
     }
+  };
+
+  const handleImportDrive = async () => {
+    console.log('handleImportDrive called');
+    console.log('Drive folder URL:', driveFolderUrl);
+    console.log('Drive access token:', driveAccessToken ? 'Present' : 'Missing');
+    
+    if (!driveFolderUrl.trim()) {
+      Alert.alert('Error', 'Please enter Google Drive folder URL or ID');
+      return;
+    }
+
+    if (!driveAccessToken) {
+      console.log('No token available - should not reach here');
+      return;
+    }
+
+    try {
+      setImporting(true);
+      
+      // Extract folder ID from URL if it's a full URL
+      let folderId = driveFolderUrl.trim();
+      const urlMatch = driveFolderUrl.match(/folders\/([a-zA-Z0-9-_]+)/);
+      if (urlMatch) {
+        folderId = urlMatch[1];
+      }
+      
+      const result = await importPhotos({
+        room_id: roomId as string,
+        source_type: 'drive',
+        drive_folder_id: folderId,
+        drive_access_token: driveAccessToken,
+      });
+
+      if (result.status === 'processing' && result.job_id) {
+        // Background import started — kick off polling
+        setImportJobId(result.job_id);
+        setExpectedTotal(result.total_found ?? 0);
+        setImportProgress({
+          status: 'processing',
+          processed: result.imported_count ?? 0,
+          total: result.total_found ?? 0,
+          ready: result.imported_count ?? 0,
+        });
+        setPhotoCount(result.imported_count ?? 0);
+        setDriveFolderUrl('');
+        // Don't setImporting(false) yet — polling will do that when done
+        return;
+      }
+
+      // Small folder — everything imported synchronously
+      Alert.alert('Success', `Imported ${result.imported_count} photos from Google Drive`);
+      setDriveFolderUrl('');
+      setImporting(false);
+      loadRoomData();
+    } catch (error: any) {
+      // Check if error is due to authentication issues
+      if (error.response?.status === 401 || error.response?.data?.detail?.includes('auth')) {
+        setDriveAccessToken(null); // Clear invalid token
+        Alert.alert(
+          'Authentication Required',
+          'Your session has expired. Please sign in again.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            {
+              text: 'Sign in with Google',
+              onPress: () => {
+                console.log('Retry auth button clicked');
+                handleGoogleSignIn();
+              }
+            },
+          ]
+        );
+      } else {
+        Alert.alert('Error', error.response?.data?.detail || error.message || 'Failed to import from Drive');
+      }
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    console.log('=== handleGoogleSignIn START ===');
+    
+    try {
+      console.log('Step 1: Fetching auth URL from backend...');
+      
+      const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || 'http://localhost:8001';
+      const response = await fetch(`${backendUrl}/api/auth/google`);
+      console.log('Step 2: Response status:', response.status);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error('Backend error response:', errorText);
+        Alert.alert('Backend Error', `Server returned ${response.status}: ${errorText.substring(0, 100)}`);
+        return;
+      }
+      
+      const data = await response.json();
+      console.log('Step 3: Auth data received:', JSON.stringify(data).substring(0, 100));
+      
+      if (!data.auth_url) {
+        Alert.alert('Configuration Error', 'No auth URL received from backend');
+        return;
+      }
+      
+      console.log('Step 4: Opening OAuth URL...');
+      
+      // For React Native/Expo: Use WebBrowser to open OAuth URL
+      if (typeof window !== 'undefined' && window.open) {
+        // Web environment
+        const authWindow = window.open(data.auth_url, 'Google Sign In', 'width=500,height=600');
+        
+        if (!authWindow) {
+          Alert.alert('Popup Blocked', 'Please allow popups for this site to sign in with Google');
+          return;
+        }
+        
+        console.log('Step 5: Waiting for postMessage from callback window...');
+        
+        // Listen for message from callback window
+        const messageHandler = (event: MessageEvent) => {
+          console.log('Step 6: Message received:', event.data);
+          
+          if (event.data && event.data.type === 'google_auth_success' && event.data.token) {
+            console.log('Step 7: Token received via postMessage!');
+            window.removeEventListener('message', messageHandler);
+            if (!authWindow.closed) {
+              authWindow.close();
+            }
+            setDriveAccessToken(event.data.token);
+            Alert.alert(
+              'Success',
+              'Signed in with Google! You can now import photos from Google Drive.'
+            );
+          }
+        };
+        
+        window.addEventListener('message', messageHandler);
+        
+        setTimeout(() => {
+          window.removeEventListener('message', messageHandler);
+          if (!authWindow.closed) {
+            authWindow.close();
+          }
+        }, 5 * 60 * 1000);
+      } else {
+        // React Native environment - use openAuthSessionAsync for OAuth
+        console.log('Step 5: Using WebBrowser.openAuthSessionAsync for React Native...');
+        const redirectUrl = 'vowselect://auth-callback';
+        const result = await WebBrowser.openAuthSessionAsync(data.auth_url, redirectUrl);
+        console.log('Step 6: Auth session result:', JSON.stringify(result));
+        
+        if (result.type === 'success' && result.url) {
+          // Extract token from the redirect URL
+          const urlParams = new URL(result.url);
+          const token = urlParams.searchParams.get('token');
+          
+          if (token) {
+            console.log('Step 7: Token received from redirect!');
+            setDriveAccessToken(token);
+            await AsyncStorage.setItem('driveAccessToken', token);
+            Alert.alert('Success', 'Signed in with Google! You can now import photos from Google Drive.');
+          } else {
+            console.log('No token in redirect URL:', result.url);
+            // Token might have been saved by auth-callback screen via deep link
+            await loadDriveToken();
+          }
+        } else if (result.type === 'cancel' || result.type === 'dismiss') {
+          console.log('Auth session was cancelled/dismissed');
+          // Check if token arrived via deep link handler
+          await loadDriveToken();
+        }
+      }
+    } catch (error: any) {
+      console.error('=== ERROR in handleGoogleSignIn ===');
+      console.error('Error type:', error.constructor.name);
+      console.error('Error message:', error.message);
+      console.error('Error stack:', error.stack);
+      Alert.alert(
+        'Sign-in Error',
+        `Failed to sign in with Google.\n\nError: ${error.message}\n\nMake sure:\n1. Backend server is running\n2. Backend URL is correct\n3. Popups are allowed`
+      );
+    }
+    
+    console.log('=== handleGoogleSignIn END ===');
   };
 
   const handleStartVoting = () => {
@@ -206,8 +418,17 @@ export default function RoomScreen() {
   }
 
   return (
-    <ScrollView style={styles.container}>
-      <View style={styles.header}>
+    <KeyboardAvoidingView
+      style={{ flex: 1 }}
+      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+      keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}
+    >
+      <ScrollView 
+        style={styles.container}
+        keyboardShouldPersistTaps="handled"
+        contentContainerStyle={{ paddingBottom: 100 }}
+      >
+        <View style={styles.header}>
         <View style={styles.headerRow}>
           <View>
             <Text style={styles.title}>Room Code</Text>
@@ -233,7 +454,38 @@ export default function RoomScreen() {
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>📸 Photos ({photoCount})</Text>
+        <Text style={styles.sectionTitle}>
+          📸 Photos ({photoCount}{expectedTotal && expectedTotal > photoCount ? ` / ${expectedTotal} expected` : ''})
+        </Text>
+
+        {/* Import progress indicator */}
+        {importProgress && importProgress.status === 'processing' && (
+          <View style={styles.progressContainer}>
+            <View style={styles.progressHeader}>
+              <ActivityIndicator size="small" color="#D946B2" />
+              <Text style={styles.progressTitle}>Importing from Google Drive...</Text>
+            </View>
+            <View style={styles.progressBarBackground}>
+              <View
+                style={[
+                  styles.progressBarFill,
+                  {
+                    width: importProgress.total > 0
+                      ? `${Math.round((importProgress.processed / importProgress.total) * 100)}%`
+                      : '0%',
+                  },
+                ]}
+              />
+            </View>
+            <Text style={styles.progressText}>
+              {importProgress.processed} / {importProgress.total} photos processed
+              {importProgress.ready !== undefined && importProgress.ready !== importProgress.processed
+                ? ` (${importProgress.ready} ready)`
+                : ''}
+              {importProgress.failed ? ` · ${importProgress.failed} failed` : ''}
+            </Text>
+          </View>
+        )}
 
         {photoCount > 0 && (
           <View style={styles.actionButtons}>
@@ -251,47 +503,78 @@ export default function RoomScreen() {
       <View style={styles.section}>
         <Text style={styles.sectionTitle}>📥 Import Photos</Text>
 
-        <Text style={styles.importLabel}>Local Files</Text>
-        <Text style={styles.helperText}>📁 Select multiple photos from your device</Text>
-        <TouchableOpacity
-          style={[styles.importButton, importing && styles.buttonDisabled]}
-          onPress={handleImportLocal}
-          disabled={importing}
-        >
-          {importing ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.importButtonText}>📷 Select & Upload Photos</Text>
-          )}
-        </TouchableOpacity>
+        {Platform.OS === 'web' && (
+          <>
+            <Text style={styles.importLabel}>Local Folder</Text>
+            <Text style={styles.helperText}>📁 Enter the folder path on the server (e.g., C:\Photos\MyAlbum)</Text>
+            <TextInput
+              style={styles.input}
+              placeholder="Folder path (e.g., C:\Photos\MyAlbum)"
+              value={localFolderPath}
+              onChangeText={setLocalFolderPath}
+              placeholderTextColor="#999"
+            />
+            <TouchableOpacity
+              style={[styles.importButton, importing && styles.buttonDisabled]}
+              onPress={handleImportLocal}
+              disabled={importing}
+            >
+              {importing ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.importButtonText}>📂 Import from Folder</Text>
+              )}
+            </TouchableOpacity>
 
-        <View style={styles.divider} />
+            <View style={styles.divider} />
+          </>
+        )}
 
         <Text style={styles.importLabel}>Google Drive</Text>
+        <Text style={styles.helperText}>☁️ Paste the Google Drive folder URL or ID</Text>
+        <Text style={styles.helperTextSmall}>Note: Drive imports require Google sign-in to download photos (even for public folders).</Text>
+        {driveAccessToken ? (
+          <View style={styles.authContainer}>
+            <View style={styles.authBadge}>
+              <Text style={styles.authBadgeText}>✓ Signed in with Google</Text>
+            </View>
+            <TouchableOpacity
+              style={styles.signOutButton}
+              onPress={handleGoogleSignOut}
+            >
+              <Text style={styles.signOutButtonText}>Sign Out</Text>
+            </TouchableOpacity>
+          </View>
+        ) : (
+          <TouchableOpacity
+            style={styles.signInButton}
+            onPress={handleGoogleSignIn}
+          >
+            <Text style={styles.signInButtonText}>🔑 Sign in with Google First</Text>
+          </TouchableOpacity>
+        )}
         <TextInput
           style={styles.input}
-          placeholder="Google Drive Folder ID"
-          value={driveFolderId}
-          onChangeText={setDriveFolderId}
+          placeholder="https://drive.google.com/drive/folders/... or folder ID"
+          value={driveFolderUrl}
+          onChangeText={setDriveFolderUrl}
           placeholderTextColor="#999"
-        />
-        <TextInput
-          style={styles.input}
-          placeholder="Google Drive Access Token"
-          value={driveAccessToken}
-          onChangeText={setDriveAccessToken}
-          secureTextEntry
-          placeholderTextColor="#999"
+          autoCapitalize="none"
         />
         <TouchableOpacity
-          style={[styles.importButton, importing && styles.buttonDisabled]}
+          style={[
+            styles.importButton,
+            (importing || !driveAccessToken) && styles.buttonDisabled
+          ]}
           onPress={handleImportDrive}
-          disabled={importing}
+          disabled={importing || !driveAccessToken}
         >
           {importing ? (
             <ActivityIndicator color="#fff" />
           ) : (
-            <Text style={styles.importButtonText}>Import from Google Drive</Text>
+            <Text style={styles.importButtonText}>
+              {driveAccessToken ? '☁️ Import from Google Drive' : '🔒 Sign in First to Import'}
+            </Text>
           )}
         </TouchableOpacity>
       </View>
@@ -300,6 +583,7 @@ export default function RoomScreen() {
         <Text style={styles.backButtonText}>← Back to Home</Text>
       </TouchableOpacity>
     </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
@@ -428,6 +712,55 @@ const styles = StyleSheet.create({
     marginBottom: 12,
     fontStyle: 'italic',
   },
+  helperTextSmall: {
+    fontSize: 11,
+    color: '#999',
+    marginBottom: 12,
+    lineHeight: 16,
+  },
+  authContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 12,
+  },
+  authBadge: {
+    backgroundColor: '#E8F5E9',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  authBadgeText: {
+    color: '#2E7D32',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  signOutButton: {
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderWidth: 1,
+    borderColor: '#D946B2',
+  },
+  signOutButtonText: {
+    color: '#D946B2',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  signInButton: {
+    backgroundColor: '#4285F4',
+    borderRadius: 8,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    marginBottom: 12,
+    alignItems: 'center',
+  },
+  signInButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
   importButton: {
     backgroundColor: '#EC4899',
     borderRadius: 12,
@@ -457,5 +790,40 @@ const styles = StyleSheet.create({
     color: '#D946B2',
     fontSize: 16,
     fontWeight: '600',
+  },
+  progressContainer: {
+    backgroundColor: '#FDF2F8',
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#F9A8D4',
+  },
+  progressHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 12,
+  },
+  progressTitle: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#D946B2',
+  },
+  progressBarBackground: {
+    height: 8,
+    backgroundColor: '#E5E7EB',
+    borderRadius: 4,
+    overflow: 'hidden',
+    marginBottom: 8,
+  },
+  progressBarFill: {
+    height: '100%',
+    backgroundColor: '#D946B2',
+    borderRadius: 4,
+  },
+  progressText: {
+    fontSize: 12,
+    color: '#6B7280',
   },
 });

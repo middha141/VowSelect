@@ -10,9 +10,12 @@ import {
   Animated,
   PanResponder,
   Image,
+  Modal,
+  TouchableWithoutFeedback,
 } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
-import { getRoomPhotos, createVote, undoVote, getCurrentUser, getUserVotes } from '../../services/api';
+import { getRoomPhotos, createVote, undoVote, getCurrentUser, getUserVotes, getPhotoBase64, getRoom } from '../../services/api';
+import { photoCache } from '../../services/photoCache';
 import { Photo } from '../../types';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -30,6 +33,12 @@ export default function SwipeScreen() {
   const [votedPhotos, setVotedPhotos] = useState<Set<string>>(new Set());
   const [userVotesMap, setUserVotesMap] = useState<Map<string, number>>(new Map());
   const [showScoreButtons, setShowScoreButtons] = useState<'left' | 'right' | null>(null);
+  const [photoRotation, setPhotoRotation] = useState(0);  // Track rotation angle in degrees
+  const [totalServerPhotos, setTotalServerPhotos] = useState(0); // Track total photos on server
+  const [expectedTotal, setExpectedTotal] = useState(0); // Expected total including importing
+  const [isImporting, setIsImporting] = useState(false);
+  const [fullScreenModalVisible, setFullScreenModalVisible] = useState(false);
+  const [imageDimensions, setImageDimensions] = useState<{width: number, height: number} | null>(null);
 
   const position = useRef(new Animated.ValueXY()).current;
   const [swiping, setSwiping] = useState(false);
@@ -38,13 +47,85 @@ export default function SwipeScreen() {
     loadData();
   }, []);
 
+  // Reset image dimensions when navigating to a new photo
+  useEffect(() => {
+    setImageDimensions(null);
+  }, [currentIndex]);
+
+  // Poll for new photos if a background import is still running
+  useEffect(() => {
+    if (loading) return;
+
+    const interval = setInterval(async () => {
+      try {
+        // Quick check: are there more ready photos on the server?
+        const roomData = await getRoom(roomId as string);
+        const serverReady = roomData.photo_count ?? 0;
+        const stillImporting = roomData.importing ?? false;
+        setIsImporting(stillImporting);
+
+        // Update expected total from import job
+        if (stillImporting && roomData.import_job) {
+          setExpectedTotal(roomData.import_job.total_photos);
+        } else {
+          setExpectedTotal(serverReady);
+        }
+
+        if (serverReady > photos.length) {
+          // Fetch only the new photos we don't have yet
+          const photosData = await getRoomPhotos(roomId as string, 0, serverReady);
+          const existingIds = new Set(photos.map((p: Photo) => p._id || p.id));
+          const newPhotos = photosData.photos.filter(
+            (p: Photo) => !existingIds.has(p._id || p.id)
+          );
+          if (newPhotos.length > 0) {
+            setPhotos((prev: Photo[]) => [...prev, ...newPhotos]);
+            photoCache.cachePhotos(roomId as string, newPhotos);
+          }
+          setTotalServerPhotos(serverReady);
+        }
+
+        // Stop polling if no active import
+        if (!stillImporting) {
+          clearInterval(interval);
+        }
+      } catch (err) {
+        console.error('Swipe photo refresh error:', err);
+      }
+    }, 5000); // check every 5 seconds
+
+    return () => clearInterval(interval);
+  }, [loading, photos.length]);
+
   const loadData = async () => {
     try {
       const user = await getCurrentUser();
       setCurrentUser(user);
 
+      // Try cache first for instant display
+      const cachedPhotos = photoCache.getRoomPhotos(roomId as string);
+      if (cachedPhotos && cachedPhotos.length > 0) {
+        setPhotos(cachedPhotos);
+        setTotalServerPhotos(cachedPhotos.length);
+      }
+
       const photosData = await getRoomPhotos(roomId as string, 0, 100);
       setPhotos(photosData.photos);
+      setTotalServerPhotos(photosData.total);
+
+      // Cache for future navigations
+      photoCache.setRoomPhotos(roomId as string, photosData.photos);
+      photoCache.cachePhotos(roomId as string, photosData.photos);
+
+      // Check if there's an active import to get expected total
+      const roomData = await getRoom(roomId as string);
+      if (roomData.importing && roomData.import_job) {
+        setExpectedTotal(roomData.import_job.total_photos);
+        setIsImporting(true);
+      } else {
+        setExpectedTotal(photosData.total);
+        setIsImporting(false);
+      }
 
       // Get user's votes to determine starting point
       const votesData = await getUserVotes(roomId as string, user.userId);
@@ -83,8 +164,8 @@ export default function SwipeScreen() {
       onPanResponderMove: (_, gesture) => {
         position.setValue({ x: gesture.dx, y: gesture.dy });
         
-        // Show score buttons based on swipe direction
-        if (Math.abs(gesture.dx) > 50) {
+        // Show score buttons based on swipe direction (left/right only)
+        if (Math.abs(gesture.dx) > 50 && Math.abs(gesture.dx) > Math.abs(gesture.dy)) {
           if (gesture.dx > 0) {
             setShowScoreButtons('right');
           } else {
@@ -97,6 +178,16 @@ export default function SwipeScreen() {
       onPanResponderRelease: (_, gesture) => {
         position.flattenOffset();
         setSwiping(false);
+
+        // Check for swipe up to open full screen (must be primarily vertical)
+        if (gesture.dy < -100 && Math.abs(gesture.dy) > Math.abs(gesture.dx) * 1.5) {
+          setFullScreenModalVisible(true);
+          Animated.spring(position, {
+            toValue: { x: 0, y: 0 },
+            useNativeDriver: false,
+          }).start();
+          return;
+        }
 
         if (Math.abs(gesture.dx) > SWIPE_THRESHOLD) {
           // Swiped enough - show score selection
@@ -126,6 +217,9 @@ export default function SwipeScreen() {
         score,
       });
 
+      // Invalidate rankings cache since votes changed
+      photoCache.invalidateRankings(roomId as string);
+
       // Animate card away
       const direction = score > 0 ? 1 : -1;
       Animated.timing(position, {
@@ -137,6 +231,7 @@ export default function SwipeScreen() {
         setCurrentIndex(currentIndex + 1);
         position.setValue({ x: 0, y: 0 });
         setShowScoreButtons(null);
+        setPhotoRotation(0);  // Reset rotation for new photo
         
         // Update voted photos
         setVotedPhotos(prev => new Set([...prev, currentPhoto._id || currentPhoto.id || '']));
@@ -168,9 +263,18 @@ export default function SwipeScreen() {
       
       position.setValue({ x: 0, y: 0 });
       setShowScoreButtons(null);
+      setPhotoRotation(0);  // Reset rotation
     } catch (error: any) {
       Alert.alert('Error', error.response?.data?.detail || 'Failed to undo vote');
     }
+  };
+
+  const handleRotateLeft = () => {
+    setPhotoRotation((prev) => (prev - 90 + 360) % 360);
+  };
+
+  const handleRotateRight = () => {
+    setPhotoRotation((prev) => (prev + 90) % 360);
   };
 
   if (loading) {
@@ -200,6 +304,14 @@ export default function SwipeScreen() {
         <Text style={styles.completeText}>
           You've voted on all {photos.length} photos
         </Text>
+        {totalServerPhotos > photos.length && (
+          <View style={{ alignItems: 'center', marginBottom: 16 }}>
+            <ActivityIndicator size="small" color="#D946B2" />
+            <Text style={{ color: '#D946B2', marginTop: 8, fontSize: 14 }}>
+              More photos importing... ({photos.length}/{totalServerPhotos} ready)
+            </Text>
+          </View>
+        )}
         <TouchableOpacity
           style={styles.primaryButton}
           onPress={() => router.push(`/rankings/${roomId}`)}
@@ -225,13 +337,69 @@ export default function SwipeScreen() {
   const currentScore = userVotesMap.get(currentPhotoId);
   const hasVoted = currentScore !== undefined;
 
-  const renderPlaceholderImage = () => {
-    // Check if photo has base64 data (uploaded photo)
-    if (currentPhoto.base64_data) {
+  const renderPlaceholderImage = (photo?: Photo, isFullScreen: boolean = false) => {
+    const photoToRender = photo || currentPhoto;
+    
+    // Check if photo has compressed data (all-sources)
+    if (photoToRender.compressed_data) {
+      const isLandscapeRotation = Math.abs(photoRotation % 180) === 90;
+      const cardWidth = SCREEN_WIDTH - 24;
+      const cardHeight = SCREEN_HEIGHT * 0.72;
+
+      // Calculate optimal scale so rotated images fill more of the card
+      let imageScale = 1;
+      if (isLandscapeRotation && imageDimensions) {
+        const imgAspect = imageDimensions.width / imageDimensions.height;
+        const cardAspect = cardWidth / cardHeight;
+
+        // Determine how resizeMode="contain" renders the image in the card
+        let renderedWidth: number, renderedHeight: number;
+        if (imgAspect > cardAspect) {
+          // Image wider than card ratio – fills card width
+          renderedWidth = cardWidth;
+          renderedHeight = cardWidth / imgAspect;
+        } else {
+          // Image taller than card ratio – fills card height
+          renderedHeight = cardHeight;
+          renderedWidth = cardHeight * imgAspect;
+        }
+
+        // After 90° rotation the visual width/height swap
+        const rotatedVisualWidth = renderedHeight;
+        const rotatedVisualHeight = renderedWidth;
+
+        // Scale up (or down) so the rotated image maximises card space
+        imageScale = Math.min(
+          cardWidth / rotatedVisualWidth,
+          cardHeight / rotatedVisualHeight,
+        );
+      } else if (isLandscapeRotation) {
+        // Fallback before onLoad fires – moderate scale-up
+        imageScale = 1.3;
+      }
+
       return (
         <Image
-          source={{ uri: `data:image/jpeg;base64,${currentPhoto.base64_data}` }}
-          style={styles.photoImage}
+          source={{ uri: `data:image/jpeg;base64,${photoToRender.compressed_data}` }}
+          style={isFullScreen 
+            ? styles.fullScreenImage 
+            : [
+                styles.photoImage, 
+                { 
+                  transform: [
+                    { rotate: `${photoRotation}deg` },
+                    { scale: imageScale }
+                  ] 
+                }
+              ]
+          }
+          resizeMode="contain"
+          onLoad={(e) => {
+            if (!isFullScreen) {
+              const { width, height } = e.nativeEvent.source;
+              setImageDimensions({ width, height });
+            }
+          }}
         />
       );
     }
@@ -240,9 +408,9 @@ export default function SwipeScreen() {
     return (
       <View style={styles.placeholderImage}>
         <Text style={styles.placeholderText}>📸</Text>
-        <Text style={styles.placeholderFilename}>{currentPhoto.filename}</Text>
+        <Text style={styles.placeholderFilename}>{photoToRender.filename}</Text>
         <Text style={styles.placeholderSource}>
-          {currentPhoto.source_type === 'local' ? '💾 Local' : currentPhoto.source_type === 'upload' ? '📤 Uploaded' : '☁️ Drive'}
+          {photoToRender.source_type === 'local' ? '💾 Local' : photoToRender.source_type === 'upload' ? '📤 Uploaded' : '☁️ Drive'}
         </Text>
       </View>
     );
@@ -255,9 +423,19 @@ export default function SwipeScreen() {
         <TouchableOpacity onPress={() => router.back()}>
           <Text style={styles.headerButton}>← Back</Text>
         </TouchableOpacity>
-        <Text style={styles.progress}>
-          {currentIndex + 1} / {photos.length}
-        </Text>
+        <View style={{ alignItems: 'center' }}>
+          <Text style={styles.progress}>
+            {currentIndex + 1} / {photos.length}
+          </Text>
+          {isImporting && expectedTotal > photos.length && (
+            <Text style={{ fontSize: 11, color: '#D946B2', marginTop: 2 }}>
+              {photos.length} ready / {expectedTotal} total
+            </Text>
+          )}
+          <Text style={{ fontSize: 11, color: '#6B7280', marginTop: 1 }}>
+            {votedPhotos.size} voted
+          </Text>
+        </View>
         <TouchableOpacity onPress={handleUndo}>
           <Text style={styles.headerButton}>↺ Undo</Text>
         </TouchableOpacity>
@@ -268,7 +446,7 @@ export default function SwipeScreen() {
         {/* Next card (behind) */}
         {currentIndex + 1 < photos.length && (
           <View style={[styles.card, styles.nextCard]}>
-            {renderPlaceholderImage()}
+            {renderPlaceholderImage(photos[currentIndex + 1])}
           </View>
         )}
 
@@ -286,14 +464,17 @@ export default function SwipeScreen() {
             },
           ]}
         >
-          {currentPhoto.source_type === 'drive' && currentPhoto.drive_thumbnail_url ? (
-            <Image
-              source={{ uri: currentPhoto.drive_thumbnail_url }}
-              style={styles.photoImage}
-            />
-          ) : (
-            renderPlaceholderImage()
-          )}
+          {renderPlaceholderImage()}
+          
+          {/* Rotate buttons */}
+          <View style={styles.rotateButtonsContainer}>
+            <TouchableOpacity style={styles.rotateButton} onPress={handleRotateLeft}>
+              <Text style={styles.rotateButtonText}>↺</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.rotateButton} onPress={handleRotateRight}>
+              <Text style={styles.rotateButtonText}>↻</Text>
+            </TouchableOpacity>
+          </View>
           
           {/* Current Score Badge */}
           {hasVoted && (
@@ -409,8 +590,33 @@ export default function SwipeScreen() {
       {!swiping && !showScoreButtons && (
         <View style={styles.instructions}>
           <Text style={styles.instructionText}>← Swipe Left to Dislike | Swipe Right to Like →</Text>
+          <Text style={[styles.instructionText, { marginTop: 4, fontSize: 12 }]}>↑ Swipe Up to View Full Screen</Text>
         </View>
       )}
+
+      {/* Full Screen Image Modal */}
+      <Modal
+        visible={fullScreenModalVisible}
+        transparent={true}
+        animationType="fade"
+        onRequestClose={() => setFullScreenModalVisible(false)}
+      >
+        <TouchableWithoutFeedback onPress={() => setFullScreenModalVisible(false)}>
+          <View style={styles.fullScreenModalContainer}>
+            <TouchableWithoutFeedback>
+              <View style={styles.fullScreenImageWrapper}>
+                {renderPlaceholderImage(currentPhoto, true)}
+                <TouchableOpacity
+                  style={styles.closeButton}
+                  onPress={() => setFullScreenModalVisible(false)}
+                >
+                  <Text style={styles.closeButtonText}>✕</Text>
+                </TouchableOpacity>
+              </View>
+            </TouchableWithoutFeedback>
+          </View>
+        </TouchableWithoutFeedback>
+      </Modal>
     </View>
   );
 }
@@ -481,13 +687,14 @@ const styles = StyleSheet.create({
   },
   cardContainer: {
     flex: 1,
-    justifyContent: 'center',
+    justifyContent: 'flex-start',
     alignItems: 'center',
-    padding: 16,
+    paddingTop: 8,
+    paddingHorizontal: 4,
   },
   card: {
-    width: SCREEN_WIDTH - 64,
-    height: SCREEN_HEIGHT * 0.6,
+    width: SCREEN_WIDTH - 24,
+    height: SCREEN_HEIGHT * 0.72,
     backgroundColor: '#fff',
     borderRadius: 20,
     shadowColor: '#000',
@@ -496,6 +703,7 @@ const styles = StyleSheet.create({
     shadowRadius: 8,
     elevation: 5,
     position: 'absolute',
+    overflow: 'hidden',
   },
   nextCard: {
     opacity: 0.5,
@@ -509,6 +717,7 @@ const styles = StyleSheet.create({
   placeholderImage: {
     width: '100%',
     height: '100%',
+    minHeight: 300,
     justifyContent: 'center',
     alignItems: 'center',
     backgroundColor: '#F3F4F6',
@@ -532,7 +741,7 @@ const styles = StyleSheet.create({
   },
   currentScoreBadge: {
     position: 'absolute',
-    top: 20,
+    bottom: 16,
     alignSelf: 'center',
     backgroundColor: '#D946B2',
     paddingHorizontal: 20,
@@ -546,6 +755,32 @@ const styles = StyleSheet.create({
   },
   currentScoreText: {
     fontSize: 16,
+    fontWeight: 'bold',
+    color: '#fff',
+  },
+  rotateButtonsContainer: {
+    position: 'absolute',
+    top: 16,
+    right: 16,
+    flexDirection: 'row',
+    gap: 8,
+    zIndex: 10,
+  },
+  rotateButton: {
+    backgroundColor: 'rgba(217, 70, 178, 0.9)',
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5,
+  },
+  rotateButtonText: {
+    fontSize: 20,
     fontWeight: 'bold',
     color: '#fff',
   },
@@ -677,6 +912,38 @@ const styles = StyleSheet.create({
   backButtonText: {
     color: '#fff',
     fontSize: 16,
+    fontWeight: 'bold',
+  },
+  fullScreenModalContainer: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.95)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullScreenImageWrapper: {
+    width: SCREEN_WIDTH,
+    height: SCREEN_HEIGHT,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullScreenImage: {
+    width: SCREEN_WIDTH,
+    height: SCREEN_HEIGHT,
+  },
+  closeButton: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  closeButtonText: {
+    fontSize: 24,
+    color: '#fff',
     fontWeight: 'bold',
   },
 });

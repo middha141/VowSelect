@@ -1,22 +1,36 @@
 {
   "expo": {
-    "name": "frontend",
-    "slug": "frontend",
+    "name": "VowSelect",
+    "slug": "vowselect",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
-    "scheme": "frontend",
+    "scheme": "vowselect",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+    "deepLinking": {
+      "enabled": true,
+      "prefixes": [
+        "vowselect://",
+        "https://vowselect.app"
+      ],
+      "config": {
+        "screens": {
+          "auth-callback": "auth-callback"
+        }
+      }
+    },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.middharahul.vowselect"
     },
     "android": {
       "adaptiveIcon": {
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#000"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.middharahul.vowselect"
     },
     "web": {
       "bundler": "metro",

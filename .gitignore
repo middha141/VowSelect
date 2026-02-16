@@ -1,91 +1,97 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# IDE and editors
-.idea/
-.vscode/
-
-# Dependencies
-node_modules/
-/node_modules
-/.pnp
-.pnp.js
-.yarn/install-state.gz
-.yarn/*
-!.yarn/patches
-!.yarn/plugins
-!.yarn/releases
-!.yarn/versions
-
-# Testing
-/coverage
-
-# Next.js
-/.next/
-/out/
-next-env.d.ts
-*.tsbuildinfo
-
-# Production builds
-/build
-dist/
-dist
-
-# Environment files (comprehensive coverage)
-
-*token.json*
-*credentials.json*
-
-# Logs and debug files
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-dump.rdb
-
-# System files
-.DS_Store
-*.pem
-
-# Python
+# ==================== PYTHON ====================
 __pycache__/
-*pyc*
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Virtual environments
 venv/
-.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-# Development tools
-chainlit.md
-.chainlit
-.ipynb_checkpoints/
-.ac
+# ==================== NODE / FRONTEND ====================
+node_modules/
+.next/
+out/
+.expo/
+.expo-shared/
+dist/
+build/
+*.jsbundle
+*.bundle
+.yarn/install-state.gz
 
-# Deployment
-.vercel
+# ==================== ENVIRONMENT ====================
+.env
+.env.local
+.env.*.local
+backend/.env
+frontend/.env
 
-# Data and databases
-agenthub/agents/youtube/db
+# ==================== IDE ====================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
 
-# Archive files and large assets
-**/*.zip
-**/*.tar.gz
-**/*.tar
-**/*.tgz
-*.pack
-*.deb
-*.dylib
+# ==================== MONGODB ====================
+data/
+mongodb/
+*.log
 
-# Build caches
-.cache/
+# ==================== TESTING ====================
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+test_result.md
+test_reports/
 
-# Mobile development
-android-sdk/ -e 
-# Environment files
-*.env
-*.env.*
--e 
-# Environment files
-*.env
-*.env.*
--e 
-# Environment files
-*.env
-*.env.*
+# ==================== PROJECT SPECIFIC ====================
+memory/
+*.bak
+*.tmp
+temp/
+cache/
+.emergent/markers/
+
+# ==================== OS ====================
+Thumbs.db
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# ==================== SECRETS ====================
+GOOGLE_*
+google_credentials.*
+oauth_token*
+secret_key*

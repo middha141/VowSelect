@@ -206,9 +206,13 @@ class DatabaseInitializer:
                             "bsonType": "string",
                             "description": "Google Drive thumbnail URL (optional)"
                         },
-                        "base64_data": {
+                        "compressed_data": {
                             "bsonType": "string",
-                            "description": "Base64 encoded image (optional)"
+                            "description": "Compressed base64 image for mobile (always stored for uploads)"
+                        },
+                        "compressed_size_kb": {
+                            "bsonType": "double",
+                            "description": "Size of compressed image in KB (optional)"
                         },
                         "filename": {
                             "bsonType": "string",

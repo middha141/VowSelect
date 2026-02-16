@@ -1,8 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   View,
   Text,
   TouchableOpacity,
+  TouchableWithoutFeedback,
   StyleSheet,
   Alert,
   ScrollView,
@@ -10,11 +11,22 @@ import {
   TextInput,
   Modal,
   Image,
+  Dimensions,
+  Animated,
+  PanResponder,
+  Platform,
+  KeyboardAvoidingView,
+  Linking,
 } from 'react-native';
+
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import * as DocumentPicker from 'expo-document-picker';
-import { getRankings, exportPhotos, getRoomPhotos } from '../../services/api';
-import { PhotoRanking, Photo } from '../../types';
+import * as WebBrowser from 'expo-web-browser';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getRankings, exportPhotos } from '../../services/api';
+import { photoCache } from '../../services/photoCache';
+import { PhotoRanking } from '../../types';
 
 export default function RankingsScreen() {
   const { id } = useLocalSearchParams();
@@ -22,27 +34,107 @@ export default function RankingsScreen() {
   const roomId = Array.isArray(id) ? id[0] : id;
 
   const [rankings, setRankings] = useState<PhotoRanking[]>([]);
-  const [photosMap, setPhotosMap] = useState<Map<string, Photo>>(new Map());
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [showExportModal, setShowExportModal] = useState(false);
   const [topN, setTopN] = useState('10');
   const [exportType, setExportType] = useState<'local' | 'drive'>('local');
-  const [exportPath, setExportPath] = useState('/path/to/export');
+  const [exportPath, setExportPath] = useState('');
+  const [driveFolderId, setDriveFolderId] = useState('');
+  const [driveAccessToken, setDriveAccessToken] = useState<string | null>(null);
+  const [fullScreenIndex, setFullScreenIndex] = useState<number | null>(null);
+
+  // Swipe animation for full-screen viewer
+  const fullScreenPan = useRef(new Animated.ValueXY()).current;
+  const fullScreenPanResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_, gesture) =>
+        Math.abs(gesture.dx) > 15 && Math.abs(gesture.dx) > Math.abs(gesture.dy) * 1.5,
+      onPanResponderMove: (_, gesture) => {
+        fullScreenPan.setValue({ x: gesture.dx, y: 0 });
+      },
+      onPanResponderRelease: (_, gesture) => {
+        const SWIPE_THRESHOLD = 80;
+        if (gesture.dx < -SWIPE_THRESHOLD) {
+          // Swiped left → next photo
+          Animated.timing(fullScreenPan, {
+            toValue: { x: -SCREEN_WIDTH, y: 0 },
+            duration: 200,
+            useNativeDriver: true,
+          }).start(() => {
+            setFullScreenIndex((prev) => {
+              if (prev === null) return null;
+              return prev < rankings.length - 1 ? prev + 1 : prev;
+            });
+            fullScreenPan.setValue({ x: 0, y: 0 });
+          });
+        } else if (gesture.dx > SWIPE_THRESHOLD) {
+          // Swiped right → previous photo
+          Animated.timing(fullScreenPan, {
+            toValue: { x: SCREEN_WIDTH, y: 0 },
+            duration: 200,
+            useNativeDriver: true,
+          }).start(() => {
+            setFullScreenIndex((prev) => {
+              if (prev === null) return null;
+              return prev > 0 ? prev - 1 : prev;
+            });
+            fullScreenPan.setValue({ x: 0, y: 0 });
+          });
+        } else {
+          // Snap back
+          Animated.spring(fullScreenPan, {
+            toValue: { x: 0, y: 0 },
+            useNativeDriver: true,
+          }).start();
+        }
+      },
+    })
+  ).current;
+
+  const fullScreenPhoto = fullScreenIndex !== null ? rankings[fullScreenIndex] : null;
 
   useEffect(() => {
     loadRankings();
+    loadDriveToken();
   }, []);
+
+  // Check for token when returning from OAuth (mobile deep link)
+  useEffect(() => {
+    const checkForNewToken = setInterval(() => {
+      loadDriveToken();
+    }, 1000);
+
+    return () => clearInterval(checkForNewToken);
+  }, []);
+
+  const loadDriveToken = async () => {
+    try {
+      const token = await AsyncStorage.getItem('driveAccessToken');
+      if (token) {
+        setDriveAccessToken(token);
+      }
+    } catch (error) {
+      console.error('Failed to load Drive token:', error);
+    }
+  };
 
   const loadRankings = async () => {
     try {
+      // Show cached rankings instantly while fetching fresh data
+      const cached = photoCache.getRankings(roomId as string);
+      if (cached && cached.length > 0) {
+        setRankings(cached);
+        setLoading(false);
+      }
+
       const data = await getRankings(roomId as string);
       setRankings(data);
-      
-      // Also fetch full photo data to get base64
-      const photosData = await getRoomPhotos(roomId as string, 0, 100);
-      const photoMap = new Map(photosData.photos.map((p: Photo) => [p._id || p.id || '', p]));
-      setPhotosMap(photoMap);
+
+      // Cache for future navigations
+      photoCache.setRankings(roomId as string, data);
+      photoCache.cachePhotos(roomId as string, data);
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to load rankings');
     } finally {
@@ -62,19 +154,49 @@ export default function RankingsScreen() {
       return;
     }
 
+    // Validate based on export type
+    if (exportType === 'local' && Platform.OS === 'web') {
+      if (!exportPath.trim()) {
+        Alert.alert('Error', 'Please enter a local folder path');
+        return;
+      }
+    } else if (exportType === 'drive') {
+      if (!driveAccessToken) {
+        Alert.alert('Error', 'Please sign in with Google first');
+        return;
+      }
+      if (!driveFolderId.trim()) {
+        Alert.alert('Error', 'Please enter a Google Drive folder');
+        return;
+      }
+    }
+
     try {
       setExporting(true);
+
+      // On mobile with "local" type → download as ZIP
+      if (exportType === 'local' && Platform.OS !== 'web') {
+        const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || 'http://localhost:8001';
+        const zipUrl = `${backendUrl}/api/export/download-zip?room_id=${encodeURIComponent(roomId as string)}&top_n=${n}`;
+        await Linking.openURL(zipUrl);
+        setExporting(false);
+        setShowExportModal(false);
+        return;
+      }
+      
       const result = await exportPhotos({
         room_id: roomId as string,
         top_n: n,
         destination_type: exportType,
-        destination_path: exportPath,
+        destination_path: exportType === 'local' ? exportPath : undefined,
+        drive_folder_id: exportType === 'drive' ? driveFolderId : undefined,
+        drive_access_token: exportType === 'drive' ? driveAccessToken ?? undefined : undefined,
       });
 
-      // Show CSV report
+      // Show success message
       Alert.alert(
-        'Export Complete',
-        `Exported top ${n} photos\n\nCSV Report:\n${result.csv_report}`,
+        'Export Complete!',
+        result.message || `Successfully exported ${result.exported_count} photos`,
         [
           {
             text: 'OK',
@@ -83,9 +205,133 @@ export default function RankingsScreen() {
         ]
       );
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to export photos');
+      const errorDetail = error.response?.data?.detail || error.message || 'Failed to export photos';
+      
+      // Check for specific permission errors
+      if (error.response?.status === 403) {
+        Alert.alert(
+          'Permission Error',
+          errorDetail,
+          [{ text: 'OK' }]
+        );
+      } else if (error.response?.status === 401) {
+        Alert.alert(
+          'Authentication Required',
+          'Please sign in with Google to export to Drive',
+          [{ text: 'OK' }]
+        );
+      } else {
+        Alert.alert('Export Error', errorDetail);
+      }
     } finally {
       setExporting(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    try {
+      const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || 'http://localhost:8001';
+      const response = await fetch(`${backendUrl}/api/auth/google`);
+      
+      if (!response.ok) {
+        const errorText = await response.text();
+        Alert.alert('Backend Error', `Server returned ${response.status}: ${errorText.substring(0, 100)}`);
+        return;
+      }
+      
+      const data = await response.json();
+      
+      if (!data.auth_url) {
+        Alert.alert('Configuration Error', 'No auth URL received from backend');
+        return;
+      }
+      
+      // For React Native/Expo: Check if we're in web or native environment
+      if (typeof window !== 'undefined' && window.open) {
+        // Web environment
+        const authWindow = window.open(data.auth_url, 'Google Sign In', 'width=500,height=600');
+        
+        if (!authWindow) {
+          Alert.alert('Popup Blocked', 'Please allow popups for this site to sign in with Google');
+          return;
+        }
+        
+        // Listen for message from callback window
+        const messageHandler = (event: MessageEvent) => {
+          if (event.data && event.data.type === 'google_auth_success' && event.data.token) {
+            // Remove listener
+            window.removeEventListener('message', messageHandler);
+            
+            // Close auth window if still open
+            if (!authWindow.closed) {
+              authWindow.close();
+            }
+            
+            // Save token
+            setDriveAccessToken(event.data.token);
+            
+            Alert.alert(
+              'Success',
+              'Signed in with Google! You can now export to Google Drive.'
+            );
+          }
+        };
+        
+        window.addEventListener('message', messageHandler);
+        
+        // Cleanup if window is closed manually
+        const checkInterval = setInterval(() => {
+          if (authWindow.closed) {
+            clearInterval(checkInterval);
+            window.removeEventListener('message', messageHandler);
+          }
+        }, 1000);
+        
+        // Cleanup after 5 minutes
+        setTimeout(() => {
+          clearInterval(checkInterval);
+          window.removeEventListener('message', messageHandler);
+          if (!authWindow.closed) {
+            authWindow.close();
+          }
+        }, 5 * 60 * 1000);
+      } else {
+        // React Native environment - use openAuthSessionAsync for OAuth
+        const redirectUrl = 'vowselect://auth-callback';
+        const result = await WebBrowser.openAuthSessionAsync(data.auth_url, redirectUrl);
+        
+        if (result.type === 'success' && result.url) {
+          // Extract token from the redirect URL
+          const urlParams = new URL(result.url);
+          const token = urlParams.searchParams.get('token');
+          
+          if (token) {
+            setDriveAccessToken(token);
+            await AsyncStorage.setItem('driveAccessToken', token);
+            Alert.alert('Success', 'Signed in with Google! You can now export to Google Drive.');
+          } else {
+            // Token might have been saved by auth-callback screen via deep link
+            await loadDriveToken();
+          }
+        } else if (result.type === 'cancel' || result.type === 'dismiss') {
+          // Check if token arrived via deep link handler
+          await loadDriveToken();
+        }
+      }
+    } catch (error: any) {
+      Alert.alert(
+        'Sign-in Error',
+        `Failed to sign in with Google.\n\nError: ${error.message}`
+      );
+    }
+  };
+
+  const handleGoogleSignOut = async () => {
+    setDriveAccessToken(null);
+    try {
+      await AsyncStorage.removeItem('driveAccessToken');
+    } catch (error) {
+      console.error('Failed to remove Drive token:', error);
     }
   };
 
@@ -129,30 +375,31 @@ export default function RankingsScreen() {
           </View>
         ) : (
           <View style={styles.rankingsList}>
-            {rankings.map((photo, index) => {
-              const fullPhoto = photosMap.get(photo.photo_id);
-              return (
+            {rankings.map((photo, index) => (
                 <View key={photo.photo_id} style={styles.rankingItem}>
                   <View style={styles.rankBadge}>
                     <Text style={styles.rankText}>#{photo.rank}</Text>
                   </View>
                   
                   {/* Photo Thumbnail */}
-                  {fullPhoto?.base64_data ? (
-                    <Image
-                      source={{ uri: `data:image/jpeg;base64,${fullPhoto.base64_data}` }}
-                      style={styles.photoThumbnail}
-                    />
-                  ) : fullPhoto?.drive_thumbnail_url ? (
-                    <Image
-                      source={{ uri: fullPhoto.drive_thumbnail_url }}
-                      style={styles.photoThumbnail}
-                    />
-                  ) : (
-                    <View style={styles.photoPlaceholder}>
-                      <Text style={styles.placeholderIcon}>📷</Text>
-                    </View>
-                  )}
+                  <TouchableOpacity onPress={() => {
+                    if (photo.compressed_data) {
+                      const idx = rankings.findIndex(r => r.photo_id === photo.photo_id);
+                      setFullScreenIndex(idx >= 0 ? idx : null);
+                    }
+                  }}>
+                    {photo.compressed_data ? (
+                      <Image
+                        source={{ uri: `data:image/jpeg;base64,${photo.compressed_data}` }}
+                        style={styles.photoThumbnail}
+                        resizeMode="cover"
+                      />
+                    ) : (
+                      <View style={styles.photoPlaceholder}>
+                        <Text style={styles.placeholderIcon}>📷</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
                   
                   <View style={styles.photoInfo}>
                     <Text style={styles.photoName} numberOfLines={1}>
@@ -171,11 +418,71 @@ export default function RankingsScreen() {
                     </Text>
                   </View>
                 </View>
-              );
-            })}
+              ))}
           </View>
         )}
       </ScrollView>
+
+      {/* Full Screen Photo Modal */}
+      <Modal
+        visible={fullScreenIndex !== null}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setFullScreenIndex(null)}
+      >
+        <View style={styles.fullScreenOverlay}>
+          <Animated.View
+            {...fullScreenPanResponder.panHandlers}
+            style={[
+              styles.fullScreenWrapper,
+              { transform: [{ translateX: fullScreenPan.x }] },
+            ]}
+          >
+            {fullScreenPhoto?.compressed_data && (
+              <Image
+                source={{ uri: `data:image/jpeg;base64,${fullScreenPhoto.compressed_data}` }}
+                style={styles.fullScreenImage}
+                resizeMode="contain"
+              />
+            )}
+            <View style={styles.fullScreenInfo}>
+              <Text style={styles.fullScreenRank}>#{fullScreenPhoto?.rank}</Text>
+              <Text style={styles.fullScreenFilename} numberOfLines={1}>{fullScreenPhoto?.filename}</Text>
+              <Text style={styles.fullScreenScore}>
+                Score: {fullScreenPhoto?.weighted_score.toFixed(2)} · {fullScreenPhoto?.vote_count} vote{fullScreenPhoto?.vote_count !== 1 ? 's' : ''}
+              </Text>
+              <Text style={styles.fullScreenCounter}>
+                {fullScreenIndex !== null ? fullScreenIndex + 1 : 0} / {rankings.length}
+              </Text>
+            </View>
+
+            {/* Navigation arrows */}
+            {fullScreenIndex !== null && fullScreenIndex > 0 && (
+              <TouchableOpacity
+                style={[styles.fullScreenNavButton, styles.fullScreenNavLeft]}
+                onPress={() => setFullScreenIndex(fullScreenIndex - 1)}
+              >
+                <Text style={styles.fullScreenNavText}>‹</Text>
+              </TouchableOpacity>
+            )}
+            {fullScreenIndex !== null && fullScreenIndex < rankings.length - 1 && (
+              <TouchableOpacity
+                style={[styles.fullScreenNavButton, styles.fullScreenNavRight]}
+                onPress={() => setFullScreenIndex(fullScreenIndex + 1)}
+              >
+                <Text style={styles.fullScreenNavText}>›</Text>
+              </TouchableOpacity>
+            )}
+
+            <TouchableOpacity
+              style={styles.fullScreenCloseButton}
+              onPress={() => setFullScreenIndex(null)}
+            >
+              <Text style={styles.fullScreenCloseText}>✕</Text>
+            </TouchableOpacity>
+          </Animated.View>
+        </View>
+      </Modal>
 
       {/* Export Modal */}
       <Modal
@@ -184,7 +491,15 @@ export default function RankingsScreen() {
         animationType="slide"
         onRequestClose={() => setShowExportModal(false)}
       >
-        <View style={styles.modalOverlay}>
+        <KeyboardAvoidingView
+          style={styles.modalOverlay}
+          behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
+        >
+          <ScrollView
+            contentContainerStyle={styles.modalScrollContent}
+            keyboardShouldPersistTaps="handled"
+            bounces={false}
+          >
           <View style={styles.modalContent}>
             <Text style={styles.modalTitle}>Export Top Photos</Text>
 
@@ -213,7 +528,7 @@ export default function RankingsScreen() {
                     exportType === 'local' && styles.toggleButtonTextActive,
                   ]}
                 >
-                  Local
+                  {Platform.OS !== 'web' ? 'Download ZIP' : 'Local Folder'}
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity
@@ -234,14 +549,66 @@ export default function RankingsScreen() {
               </TouchableOpacity>
             </View>
 
-            <Text style={styles.label}>Export Path</Text>
-            <TextInput
-              style={styles.input}
-              value={exportPath}
-              onChangeText={setExportPath}
-              placeholder="/path/to/export"
-              placeholderTextColor="#999"
-            />
+            {exportType === 'local' ? (
+              Platform.OS !== 'web' ? (
+                <View style={styles.zipInfo}>
+                  <Text style={styles.zipInfoIcon}>📦</Text>
+                  <Text style={styles.zipInfoText}>
+                    Top {topN || '?'} photos will be downloaded as a ZIP file to your device
+                  </Text>
+                </View>
+              ) : (
+                <>
+                  <Text style={styles.label}>Local Folder Path</Text>
+                  <Text style={styles.helperText}>
+                    Photos will be saved to this folder on the server
+                  </Text>
+                  <TextInput
+                    style={styles.input}
+                    value={exportPath}
+                    onChangeText={setExportPath}
+                    placeholder="C:\Photos\Export"
+                    placeholderTextColor="#999"
+                  />
+                </>
+              )
+            ) : (
+              <>
+                <Text style={styles.label}>Google Drive</Text>
+                {driveAccessToken ? (
+                  <View style={styles.authRow}>
+                    <View style={[styles.authBadge, { flex: 1 }]}>
+                      <Text style={styles.authBadgeText}>✓ Signed in with Google</Text>
+                    </View>
+                    <TouchableOpacity
+                      style={styles.signOutButton}
+                      onPress={handleGoogleSignOut}
+                    >
+                      <Text style={styles.signOutButtonText}>Sign Out</Text>
+                    </TouchableOpacity>
+                  </View>
+                ) : (
+                  <TouchableOpacity
+                    style={styles.signInButton}
+                    onPress={handleGoogleSignIn}
+                  >
+                    <Text style={styles.signInButtonText}>🔑 Sign in with Google</Text>
+                  </TouchableOpacity>
+                )}
+                <Text style={styles.label}>Drive Folder ID or URL</Text>
+                <Text style={styles.helperText}>
+                  A new folder will be created inside this folder
+                </Text>
+                <TextInput
+                  style={styles.input}
+                  value={driveFolderId}
+                  onChangeText={setDriveFolderId}
+                  placeholder="Folder ID or URL"
+                  placeholderTextColor="#999"
+                  autoCapitalize="none"
+                />
+              </>
+            )}
 
             <View style={styles.modalButtons}>
               <TouchableOpacity
@@ -263,7 +630,8 @@ export default function RankingsScreen() {
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+          </ScrollView>
+        </KeyboardAvoidingView>
       </Modal>
     </View>
   );
@@ -404,6 +772,9 @@ const styles = StyleSheet.create({
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
+  },
+  modalScrollContent: {
+    flexGrow: 1,
     justifyContent: 'flex-end',
   },
   modalContent: {
@@ -412,6 +783,23 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     padding: 24,
     paddingBottom: 48,
+  },
+  zipInfo: {
+    backgroundColor: '#F0F9FF',
+    borderRadius: 12,
+    padding: 16,
+    alignItems: 'center',
+    marginBottom: 16,
+    gap: 8,
+  },
+  zipInfoIcon: {
+    fontSize: 32,
+  },
+  zipInfoText: {
+    fontSize: 14,
+    color: '#1f2937',
+    textAlign: 'center',
+    lineHeight: 20,
   },
   modalTitle: {
     fontSize: 24,
@@ -481,5 +869,133 @@ const styles = StyleSheet.create({
     color: '#666',
     fontSize: 16,
     fontWeight: 'bold',
+  },
+  helperText: {
+    fontSize: 13,
+    color: '#999',
+    marginBottom: 8,
+    marginTop: -8,
+  },
+  signInButton: {
+    backgroundColor: '#4285F4',
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    marginBottom: 16,
+    alignItems: 'center',
+  },
+  signInButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+  authBadge: {
+    backgroundColor: '#10B981',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  authBadgeText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  authRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 16,
+  },
+  signOutButton: {
+    backgroundColor: '#EF4444',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    alignItems: 'center',
+  },
+  signOutButtonText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  fullScreenOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.95)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullScreenWrapper: {
+    width: SCREEN_WIDTH,
+    height: SCREEN_HEIGHT,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullScreenImage: {
+    width: SCREEN_WIDTH,
+    height: SCREEN_HEIGHT * 0.75,
+  },
+  fullScreenInfo: {
+    position: 'absolute',
+    bottom: 60,
+    alignItems: 'center',
+    paddingHorizontal: 20,
+  },
+  fullScreenRank: {
+    fontSize: 28,
+    fontWeight: 'bold',
+    color: '#D946B2',
+    marginBottom: 4,
+  },
+  fullScreenFilename: {
+    fontSize: 16,
+    color: '#fff',
+    marginBottom: 4,
+  },
+  fullScreenScore: {
+    fontSize: 14,
+    color: '#ccc',
+  },
+  fullScreenCloseButton: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(255, 255, 255, 0.3)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullScreenCloseText: {
+    fontSize: 24,
+    color: '#fff',
+    fontWeight: 'bold',
+  },
+  fullScreenCounter: {
+    fontSize: 13,
+    color: '#999',
+    marginTop: 4,
+  },
+  fullScreenNavButton: {
+    position: 'absolute',
+    top: '45%',
+    width: 44,
+    height: 60,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.15)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  fullScreenNavLeft: {
+    left: 8,
+  },
+  fullScreenNavRight: {
+    right: 8,
+  },
+  fullScreenNavText: {
+    fontSize: 36,
+    color: '#fff',
+    fontWeight: '300',
   },
 });
