@@ -173,10 +173,173 @@ async def update_photos_schema():
         client.close()
 
 
+async def update_users_schema():
+    """Update the users collection to support Google authentication"""
+    
+    mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+    db_name = os.environ.get("DB_NAME", "vowselect")
+    
+    client = AsyncIOMotorClient(mongo_url, server_api=ServerApi('1'))
+    db = client[db_name]
+    
+    print(f"Connecting to database: {db_name}")
+    
+    try:
+        collections = await db.list_collection_names()
+        collection_exists = "users" in collections
+        
+        if collection_exists:
+            print("Collection 'users' exists, updating validator...")
+            await db.command({
+                "collMod": "users",
+                "validator": {
+                    "$jsonSchema": {
+                        "bsonType": "object",
+                        "required": ["username", "created_at", "is_guest"],
+                        "properties": {
+                            "_id": {"bsonType": "objectId"},
+                            "username": {
+                                "bsonType": "string",
+                                "description": "Username (guest) or display name (Google user)"
+                            },
+                            "is_guest": {
+                                "bsonType": "bool",
+                                "description": "Whether this is a guest user or Google-authenticated user"
+                            },
+                            "google_id": {
+                                "bsonType": "string",
+                                "description": "Google user ID (for authenticated users)"
+                            },
+                            "email": {
+                                "bsonType": "string",
+                                "description": "Email address (for authenticated users)"
+                            },
+                            "display_name": {
+                                "bsonType": "string",
+                                "description": "Full display name from Google (for authenticated users)"
+                            },
+                            "profile_picture": {
+                                "bsonType": "string",
+                                "description": "Profile picture URL from Google (for authenticated users)"
+                            },
+                            "created_at": {
+                                "bsonType": "date",
+                                "description": "Account creation timestamp"
+                            },
+                            "last_login": {
+                                "bsonType": "date",
+                                "description": "Last login timestamp (for authenticated users)"
+                            }
+                        }
+                    }
+                }
+            })
+            print("✓ Successfully updated users collection schema")
+            
+            # Add index on google_id (sparse index - only for non-null values)
+            await db['users'].create_index("google_id", unique=True, sparse=True)
+            print("✓ Added google_id index")
+            
+            # Add index on email (sparse index)
+            await db['users'].create_index("email", sparse=True)
+            print("✓ Added email index")
+            
+            # Update existing users to have is_guest = True
+            result = await db['users'].update_many(
+                {"is_guest": {"$exists": False}},
+                {"$set": {"is_guest": True}}
+            )
+            print(f"✓ Updated {result.modified_count} existing users to mark as guests")
+            
+        else:
+            print("Collection 'users' does not exist yet.")
+            print("✓ It will be created with the correct schema when the server starts")
+    
+    except OperationFailure as e:
+        print(f"✗ Failed to update users schema: {e}")
+        raise
+    
+    finally:
+        client.close()
+
+
+async def update_rooms_schema():
+    """Update the rooms collection to include room names"""
+    
+    mongo_url = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+    db_name = os.environ.get("DB_NAME", "vowselect")
+    
+    client = AsyncIOMotorClient(mongo_url, server_api=ServerApi('1'))
+    db = client[db_name]
+    
+    print(f"Connecting to database: {db_name}")
+    
+    try:
+        collections = await db.list_collection_names()
+        collection_exists = "rooms" in collections
+        
+        if collection_exists:
+            print("Collection 'rooms' exists, updating validator...")
+            await db.command({
+                "collMod": "rooms",
+                "validator": {
+                    "$jsonSchema": {
+                        "bsonType": "object",
+                        "required": ["code", "creator_id", "created_at", "status"],
+                        "properties": {
+                            "_id": {"bsonType": "objectId"},
+                            "code": {
+                                "bsonType": "string",
+                                "description": "5-digit room code"
+                            },
+                            "name": {
+                                "bsonType": "string",
+                                "description": "Room name (optional)"
+                            },
+                            "creator_id": {
+                                "bsonType": "string",
+                                "description": "ID of user who created the room"
+                            },
+                            "created_at": {
+                                "bsonType": "date",
+                                "description": "Room creation timestamp"
+                            },
+                            "status": {
+                                "bsonType": "string",
+                                "enum": ["active", "completed", "archived"],
+                                "description": "Room status"
+                            }
+                        }
+                    }
+                }
+            })
+            print("✓ Successfully updated rooms collection schema")
+            
+            # Add default room name for existing rooms (based on code)
+            result = await db['rooms'].update_many(
+                {"name": {"$exists": False}},
+                [{"$set": {"name": {"$concat": ["Room ", "$code"]}}}]
+            )
+            print(f"✓ Added default names to {result.modified_count} existing rooms")
+            
+        else:
+            print("Collection 'rooms' does not exist yet.")
+            print("✓ It will be created with the correct schema when the server starts")
+    
+    except OperationFailure as e:
+        print(f"✗ Failed to update rooms schema: {e}")
+        raise
+    
+    finally:
+        client.close()
+
+
 async def update_all_schemas():
     """Run all schema updates"""
     await update_import_jobs_schema()
     await update_photos_schema()
+    await update_users_schema()
+    await update_rooms_schema()
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Query, Body, UploadFile, File, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, Query, Body, UploadFile, File, BackgroundTasks, Request, Header
 from fastapi.responses import StreamingResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.server_api import ServerApi
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, validator
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 from pathlib import Path
@@ -21,6 +22,15 @@ import zipfile
 from PIL import Image
 from bson import ObjectId
 import time
+import secrets
+import re
+from html import escape
+
+# Security imports
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from jose import jwt, JWTError
 
 # ==================== IN-MEMORY CACHE ====================
 
@@ -67,7 +77,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
-from google.auth.transport.requests import Request
+from google.auth.transport.requests import Request as GoogleAuthRequest
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -75,6 +85,14 @@ load_dotenv(ROOT_DIR / '.env')
 # MongoDB connection - initialized on app startup
 mongo_url = os.environ['MONGO_URL']
 db_name = os.environ['DB_NAME']
+
+# Security configuration
+SECRET_KEY = os.environ.get('SECRET_KEY', secrets.token_urlsafe(32))
+ALLOWED_ORIGINS = [origin.strip() for origin in os.environ.get('ALLOWED_ORIGINS', 'http://localhost:8081,http://localhost:19006').split(',')]
+RATE_LIMIT = os.environ.get('RATE_LIMIT_PER_MINUTE', '60')
+
+# Log CORS origins on startup
+print(f"✅ CORS Allowed Origins: {ALLOWED_ORIGINS}", flush=True)
 
 # Google OAuth Configuration
 GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID')
@@ -100,6 +118,35 @@ db = None
 
 # Create the main app
 app = FastAPI(title="VowSelect API")
+
+# Add rate limiter
+limiter = Limiter(key_func=get_remote_address, default_limits=[f"{RATE_LIMIT}/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# Add validation error handler for debugging
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.error(f"❌ Validation error on {request.method} {request.url.path}")
+    logger.error(f"Request body: {await request.body()}")
+    logger.error(f"Validation errors: {exc.errors()}")
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
+
+# Add session middleware with secure secret key
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=SECRET_KEY,
+    session_cookie="vowselect_session",
+    max_age=3600,  # 1 hour
+    same_site="lax",
+    https_only=False  # Set to True in production with HTTPS
+)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -129,7 +176,13 @@ class PyObjectId(str):
 class User(BaseModel):
     id: Optional[str] = Field(None, alias="_id")
     username: str
+    is_guest: bool = True
+    google_id: Optional[str] = None
+    email: Optional[str] = None
+    display_name: Optional[str] = None
+    profile_picture: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
+    last_login: Optional[datetime] = None
 
     class Config:
         populate_by_name = True
@@ -138,6 +191,7 @@ class User(BaseModel):
 class Room(BaseModel):
     id: Optional[str] = Field(None, alias="_id")
     code: str  # 5-digit code
+    name: Optional[str] = None
     creator_id: str
     created_at: datetime = Field(default_factory=datetime.utcnow)
     status: str = "active"  # active, completed, archived
@@ -213,22 +267,142 @@ class ExportJob(BaseModel):
         populate_by_name = True
 
 
+# ==================== INPUT VALIDATION HELPERS ====================
+
+def validate_room_code(code: str) -> bool:
+    """Validate room code is exactly 5 digits"""
+    return bool(re.match(r'^\d{5}$', code))
+
+def sanitize_username(username: str) -> str:
+    """Sanitize username to prevent XSS and injection attacks"""
+    # Remove HTML tags and escape special characters
+    clean = escape(username.strip())
+    # Only allow alphanumeric, spaces, underscores, and hyphens
+    clean = re.sub(r'[^a-zA-Z0-9_ -]', '', clean)
+    return clean[:50]  # Limit length
+
+def sanitize_string(text: str, max_length: int = 200) -> str:
+    """Sanitize general string input"""
+    return escape(text.strip())[:max_length]
+
+def validate_object_id(obj_id: str) -> bool:
+    """Validate MongoDB ObjectId format"""
+    return bool(re.match(r'^[a-f0-9]{24}$', obj_id))
+
+# ==================== JWT HELPERS ====================
+
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24 * 7  # 7 days
+
+def create_access_token(data: dict) -> str:
+    """Create a JWT access token"""
+    from datetime import timedelta
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(hours=JWT_EXPIRATION_HOURS)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=JWT_ALGORITHM)
+    return encoded_jwt
+
+def verify_access_token(token: str) -> dict:
+    """Verify and decode a JWT access token"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[JWT_ALGORITHM])
+        return payload
+    except JWTError:
+        return None
+
+async def get_authenticated_user(authorization: str = None) -> dict:
+    """Get authenticated Google user from JWT token (not guest)"""
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(
+            status_code=401, 
+            detail="You must be signed in with Google to access this feature"
+        )
+    
+    token = authorization.split(' ')[1]
+    payload = verify_access_token(token)
+    
+    if not payload:
+        raise HTTPException(
+            status_code=401, 
+            detail="Invalid or expired session. Please sign in again."
+        )
+    
+    user_id = payload.get('user_id')
+    is_guest = payload.get('is_guest', True)
+    
+    if is_guest:
+        raise HTTPException(
+            status_code=403,
+            detail="You must be signed in with Google to access this feature"
+        )
+    
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    
+    if not user or user.get('is_guest', True):
+        raise HTTPException(
+            status_code=403,
+            detail="You must be signed in with Google to access this feature"
+        )
+    
+    return user
+
 # ==================== REQUEST/RESPONSE MODELS ====================
 
 class CreateUserRequest(BaseModel):
-    username: str
+    username: str = Field(..., min_length=2, max_length=50)
+    
+    @validator('username')
+    def validate_username(cls, v):
+        if not re.match(r'^[a-zA-Z0-9_ -]+$', v):
+            raise ValueError('Username can only contain letters, numbers, spaces, underscores and hyphens')
+        return sanitize_username(v)
+
+
+class CreateRoomRequest(BaseModel):
+    creator_id: str = Field(..., min_length=24, max_length=24)
+    name: Optional[str] = Field(None, min_length=1, max_length=100)
+    
+    @validator('creator_id')
+    def validate_creator_id(cls, v):
+        if not validate_object_id(v):
+            raise ValueError('Invalid user ID format')
+        return v
+    
+    @validator('name')
+    def validate_name(cls, v):
+        if v:
+            return sanitize_string(v, 100)
+        return v
 
 
 class CreateRoomResponse(BaseModel):
     room_id: str
     code: str
+    name: Optional[str] = None
     creator_id: str
 
 
+class AuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: User
+
+
 class JoinRoomRequest(BaseModel):
-    code: str
-    user_id: str
-    username: str
+    code: str = Field(..., pattern=r'^\d{5}$')
+    user_id: str = Field(..., min_length=24, max_length=24)
+    username: str = Field(..., min_length=2, max_length=50)
+    
+    @validator('username')
+    def validate_username(cls, v):
+        return sanitize_username(v)
+    
+    @validator('user_id')
+    def validate_user_id(cls, v):
+        if not validate_object_id(v):
+            raise ValueError('Invalid user ID format')
+        return v
 
 
 class ImportPhotosRequest(BaseModel):
@@ -240,10 +414,22 @@ class ImportPhotosRequest(BaseModel):
 
 
 class VoteRequest(BaseModel):
-    room_id: str
-    photo_id: str
-    user_id: str
-    score: int
+    room_id: str = Field(..., min_length=24, max_length=24)
+    photo_id: str = Field(..., min_length=24, max_length=24)
+    user_id: str = Field(..., min_length=24, max_length=24)
+    score: int = Field(..., ge=-3, le=3)
+    
+    @validator('score')
+    def validate_score(cls, v):
+        if v == 0:
+            raise ValueError('Score cannot be 0, must be -3 to -1 or 1 to 3')
+        return v
+    
+    @validator('room_id', 'photo_id', 'user_id')
+    def validate_ids(cls, v):
+        if not validate_object_id(v):
+            raise ValueError('Invalid ID format')
+        return v
 
 
 class UndoVoteRequest(BaseModel):
@@ -687,13 +873,253 @@ async def exchange_token(body: dict = Body(...)):
         raise HTTPException(status_code=400, detail=f"Failed to exchange token: {str(e)}")
 
 
+# ==================== USER LOGIN AUTHENTICATION ====================
+
+@api_router.get("/auth/login")
+async def google_login():
+    """Initiate Google OAuth flow for user login"""
+    if not all([GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET]):
+        raise HTTPException(
+            status_code=500,
+            detail="Google OAuth not configured"
+        )
+    
+    # Use a different redirect URI for user login
+    login_redirect_uri = os.environ.get('GOOGLE_LOGIN_REDIRECT_URI', GOOGLE_REDIRECT_URI)
+    
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uris": [login_redirect_uri],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=[
+            'openid',
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/userinfo.profile',
+        ],
+        redirect_uri=login_redirect_uri
+    )
+    
+    authorization_url, state = flow.authorization_url(
+        access_type='online',
+        prompt='select_account'
+    )
+    
+    return {"auth_url": authorization_url, "state": state}
+
+
+@api_router.get("/auth/callback/login")
+async def google_login_callback(code: str, state: str = None):
+    """Handle Google OAuth callback for user login"""
+    if not code:
+        raise HTTPException(status_code=400, detail="Authorization code missing")
+    
+    login_redirect_uri = os.environ.get('GOOGLE_LOGIN_REDIRECT_URI', GOOGLE_REDIRECT_URI)
+    
+    flow = Flow.from_client_config(
+        {
+            "web": {
+                "client_id": GOOGLE_CLIENT_ID,
+                "client_secret": GOOGLE_CLIENT_SECRET,
+                "redirect_uris": [login_redirect_uri],
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        },
+        scopes=[
+            'openid',
+            'https://www.googleapis.com/auth/userinfo.email',
+            'https://www.googleapis.com/auth/userinfo.profile',
+        ],
+        redirect_uri=login_redirect_uri
+    )
+    
+    try:
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        
+        # Get user info from Google
+        import requests
+        userinfo_response = requests.get(
+            'https://www.googleapis.com/oauth2/v2/userinfo',
+            headers={'Authorization': f'Bearer {credentials.token}'}
+        )
+        
+        if userinfo_response.status_code != 200:
+            raise HTTPException(status_code=400, detail="Failed to get user info from Google")
+        
+        userinfo = userinfo_response.json()
+        google_id = userinfo.get('id')
+        email = userinfo.get('email')
+        display_name = userinfo.get('name')
+        profile_picture = userinfo.get('picture')
+        
+        # Check if user exists
+        user = await db.users.find_one({"google_id": google_id})
+        
+        if user:
+            # Update last login
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$set": {"last_login": datetime.utcnow()}}
+            )
+            user["_id"] = str(user["_id"])
+        else:
+            # Create new user
+            user_dict = {
+                "username": display_name or email.split('@')[0],
+                "is_guest": False,
+                "google_id": google_id,
+                "email": email,
+                "display_name": display_name,
+                "profile_picture": profile_picture,
+                "created_at": datetime.utcnow(),
+                "last_login": datetime.utcnow()
+            }
+            result = await db.users.insert_one(user_dict)
+            user_dict["_id"] = str(result.inserted_id)
+            user = user_dict
+        
+        # Create JWT token
+        token_data = {
+            "user_id": str(user["_id"]),
+            "email": email,
+            "is_guest": False
+        }
+        access_token = create_access_token(token_data)
+        
+        # Redirect with token
+        return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Login Successful</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    min-height: 100vh;
+                    margin: 0;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                }}
+                .container {{
+                    background: white;
+                    padding: 40px;
+                    border-radius: 20px;
+                    text-align: center;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 400px;
+                }}
+                h1 {{ color: #D946B2; margin-bottom: 20px; }}
+                .checkmark {{ font-size: 60px; color: #34a853; margin-bottom: 20px; }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="checkmark">✓</div>
+                <h1>Login Successful!</h1>
+                <p id="status">Redirecting to app...</p>
+            </div>
+            <script>
+                const token = '{access_token}';
+                const isMobile = /iPhone|iPad|iPod|Android|webOS|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+                
+                console.log('Login success page loaded. isMobile:', isMobile);
+                console.log('Token:', token.substring(0, 20) + '...');
+                
+                if (isMobile) {{
+                    console.log('Mobile detected - using deep link');
+                    // Mobile: use deep link
+                    const deepLink = 'vowselect://login-callback?token=' + encodeURIComponent(token);
+                    console.log('Setting location to deep link:', deepLink);
+                    window.location.href = deepLink;
+                }} else {{
+                    console.log('Web environment detected - redirecting to Expo dev server');
+                    // Web development: redirect to Expo web dev server
+                    // This URL will be caught by WebBrowser.openAuthSessionAsync
+                    const webDevRedirect = 'http://localhost:8081/login-callback?token=' + encodeURIComponent(token);
+                    console.log('Redirecting to:', webDevRedirect);
+                    window.location.href = webDevRedirect;
+                }}
+            </script>
+        </body>
+        </html>
+        """)
+    except Exception as e:
+        logger.error(f"Login callback error: {e}")
+        raise HTTPException(status_code=400, detail=f"Failed to complete login: {str(e)}")
+
+
+@api_router.get("/auth/verify")
+async def verify_token(authorization: str = None):
+    """Verify JWT token and return user info"""
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail="Invalid authorization header")
+    
+    token = authorization.split(' ')[1]
+    payload = verify_access_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    user_id = payload.get('user_id')
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user["_id"] = str(user["_id"])
+    return User(**user)
+
+
+@api_router.post("/auth/logout")
+async def logout():
+    """Logout (client should clear token)"""
+    return {"message": "Logged out successfully"}
+
+
+@api_router.get("/auth/me", response_model=User)
+async def get_current_user(authorization: str = Header(None)):
+    """Get current authenticated user"""
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    
+    token = authorization.split(' ')[1]
+    payload = verify_access_token(token)
+    
+    if not payload:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    
+    user_id = payload.get('user_id')
+    user = await db.users.find_one({"_id": ObjectId(user_id)})
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Convert _id to id for the response
+    user["id"] = str(user["_id"])
+    user["_id"] = str(user["_id"])
+    logger.info(f"✅ Returning auth user: {user}")
+    return User(**user)
+
+
 # ==================== USER ROUTES ====================
 
 @api_router.post("/users", response_model=User)
-async def create_user(request: CreateUserRequest):
+@limiter.limit("10/minute")
+async def create_user(body: CreateUserRequest, request: Request):
     """Create a guest user"""
     user_dict = {
-        "username": request.username,
+        "username": body.username,
+        "is_guest": True,
         "created_at": datetime.utcnow()
     }
     
@@ -714,10 +1140,45 @@ async def get_user(user_id: str):
     return User(**user)
 
 
+@api_router.get("/users/{user_id}/rooms")
+async def get_user_rooms(user_id: str):
+    """Get all rooms a user is part of"""
+    if not validate_object_id(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user ID")
+    
+    # Get rooms where user is creator
+    created_rooms = await db.rooms.find({"creator_id": user_id}).to_list(100)
+    
+    # Get rooms where user is participant
+    participations = await db.room_participants.find({"user_id": user_id}).to_list(100)
+    participant_room_ids = [p["room_id"] for p in participations]
+    
+    # Get participant rooms that aren't already in created_rooms
+    participant_rooms = []
+    if participant_room_ids:
+        created_room_ids = [str(r["_id"]) for r in created_rooms]
+        filtered_participant_room_ids = [rid for rid in participant_room_ids if rid not in created_room_ids]
+        
+        if filtered_participant_room_ids:
+            participant_rooms = await db.rooms.find({
+                "_id": {"$in": [ObjectId(rid) for rid in filtered_participant_room_ids]}
+            }).to_list(100)
+    
+    # Combine and format
+    all_rooms = created_rooms + participant_rooms
+    
+    for room in all_rooms:
+        room["_id"] = str(room["_id"])
+        room["id"] = room["_id"]
+    
+    return {"rooms": all_rooms}
+
+
 # ==================== ROOM ROUTES ====================
 
 @api_router.post("/rooms", response_model=CreateRoomResponse)
-async def create_room(user_id: str = Query(...)):
+@limiter.limit("5/minute")
+async def create_room(body: CreateRoomRequest, request: Request):
     """Create a new selection room"""
     # Generate unique code
     code = generate_room_code()
@@ -727,7 +1188,8 @@ async def create_room(user_id: str = Query(...)):
     # Create room
     room_dict = {
         "code": code,
-        "creator_id": user_id,
+        "name": body.name or f"Room {code}",
+        "creator_id": body.creator_id,
         "created_at": datetime.utcnow(),
         "status": "active"
     }
@@ -736,10 +1198,16 @@ async def create_room(user_id: str = Query(...)):
     room_id = str(result.inserted_id)
     
     # Add creator as participant
+    user = await db.users.find_one({"_id": ObjectId(body.creator_id)})
+    if not user:
+        # Rollback room creation
+        await db.rooms.delete_one({"_id": result.inserted_id})
+        raise HTTPException(status_code=404, detail="User not found")
+    
     participant_dict = {
         "room_id": room_id,
-        "user_id": user_id,
-        "username": (await db.users.find_one({"_id": ObjectId(user_id)}))["username"],
+        "user_id": body.creator_id,
+        "username": user["username"],
         "joined_at": datetime.utcnow()
     }
     await db.room_participants.insert_one(participant_dict)
@@ -747,14 +1215,15 @@ async def create_room(user_id: str = Query(...)):
     return CreateRoomResponse(
         room_id=room_id,
         code=code,
-        creator_id=user_id
+        name=room_dict["name"],
+        creator_id=body.creator_id
     )
 
 
 @api_router.post("/rooms/join")
-async def join_room(request: JoinRoomRequest):
+async def join_room(body: JoinRoomRequest):
     """Join an existing room"""
-    room = await get_room_by_code(request.code)
+    room = await get_room_by_code(body.code)
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
     
@@ -763,7 +1232,7 @@ async def join_room(request: JoinRoomRequest):
     # Check if user already in room
     existing = await db.room_participants.find_one({
         "room_id": room_id,
-        "user_id": request.user_id
+        "user_id": body.user_id
     })
     
     if existing:
@@ -772,8 +1241,8 @@ async def join_room(request: JoinRoomRequest):
     # Add participant
     participant_dict = {
         "room_id": room_id,
-        "user_id": request.user_id,
-        "username": request.username,
+        "user_id": body.user_id,
+        "username": body.username,
         "joined_at": datetime.utcnow()
     }
     await db.room_participants.insert_one(participant_dict)
@@ -1053,19 +1522,19 @@ class UploadPhotosRequest(BaseModel):
 
 
 @api_router.post("/photos/upload-json")
-async def upload_photos_json(request: UploadPhotosRequest, background_tasks: BackgroundTasks):
+async def upload_photos_json(body: UploadPhotosRequest, background_tasks: BackgroundTasks):
     """Upload photos as JSON with base64 data"""
-    logger.info(f"JSON upload request received for room: {request.room_id}")
-    logger.info(f"Number of photos: {len(request.photos)}")
+    logger.info(f"JSON upload request received for room: {body.room_id}")
+    logger.info(f"Number of photos: {len(body.photos)}")
     
-    room = await db.rooms.find_one({"_id": ObjectId(request.room_id)})
+    room = await db.rooms.find_one({"_id": ObjectId(body.room_id)})
     if not room:
-        logger.error(f"Room not found: {request.room_id}")
+        logger.error(f"Room not found: {body.room_id}")
         raise HTTPException(status_code=404, detail="Room not found")
     
     # Create import job
     job_dict = {
-        "room_id": request.room_id,
+        "room_id": body.room_id,
         "source_type": "upload",
         "status": "processing",
         "total_photos": 0,
@@ -1080,12 +1549,12 @@ async def upload_photos_json(request: UploadPhotosRequest, background_tasks: Bac
         
         # Get current max index
         max_photo = await db.photos.find_one(
-            {"room_id": request.room_id},
+            {"room_id": body.room_id},
             sort=[("index", -1)]
         )
         current_index = max_photo["index"] + 1 if max_photo else 0
         
-        for photo_data in request.photos:
+        for photo_data in body.photos:
             # Compress inline - never store original heavy data
             try:
                 b64_str = photo_data["base64_data"]
@@ -1099,7 +1568,7 @@ async def upload_photos_json(request: UploadPhotosRequest, background_tasks: Bac
             
             # Store only compressed version
             photo_dict = {
-                "room_id": request.room_id,
+                "room_id": body.room_id,
                 "source_type": "upload",
                 "filename": photo_data["filename"],
                 "compressed_data": compressed_base64,
@@ -1123,8 +1592,8 @@ async def upload_photos_json(request: UploadPhotosRequest, background_tasks: Bac
         )
         
         logger.info(f"Successfully uploaded {imported_count} photos")
-        photos_cache.invalidate_prefix(f"photos:{request.room_id}:")
-        rankings_cache.invalidate(f"rankings:{request.room_id}")
+        photos_cache.invalidate_prefix(f"photos:{body.room_id}:")
+        rankings_cache.invalidate(f"rankings:{body.room_id}")
         return {
             "job_id": job_id,
             "status": "completed",
@@ -1236,16 +1705,20 @@ async def upload_photos(
 
 
 @api_router.post("/photos/import")
-async def import_photos(request: ImportPhotosRequest, background_tasks: BackgroundTasks):
+async def import_photos(body: ImportPhotosRequest, background_tasks: BackgroundTasks, authorization: str = None):
     """Import photos into a room"""
-    room = await db.rooms.find_one({"_id": ObjectId(request.room_id)})
+    # Check if Drive operation requires Google authentication
+    if body.source_type == "drive":
+        await get_authenticated_user(authorization)
+    
+    room = await db.rooms.find_one({"_id": ObjectId(body.room_id)})
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
     
     # Create import job
     job_dict = {
-        "room_id": request.room_id,
-        "source_type": request.source_type,
+        "room_id": body.room_id,
+        "source_type": body.source_type,
         "status": "processing",
         "total_photos": 0,
         "processed_photos": 0,
@@ -1257,27 +1730,27 @@ async def import_photos(request: ImportPhotosRequest, background_tasks: Backgrou
     try:
         imported_count = 0
         
-        if request.source_type == "local":
+        if body.source_type == "local":
             # Import from local folder
-            if not request.folder_path:
+            if not body.folder_path:
                 raise HTTPException(status_code=400, detail="Folder path required for local import")
             
             # Scan folder recursively for images
-            image_paths = scan_local_folder_for_images(request.folder_path)
+            image_paths = scan_local_folder_for_images(body.folder_path)
             
             if not image_paths:
                 raise HTTPException(status_code=400, detail="No image files found in the specified folder")
             
             # Get current max index
             max_photo = await db.photos.find_one(
-                {"room_id": request.room_id},
+                {"room_id": body.room_id},
                 sort=[("index", -1)]
             )
             current_index = max_photo["index"] + 1 if max_photo else 0
             
             for path in image_paths:
                 photo_dict = {
-                    "room_id": request.room_id,
+                    "room_id": body.room_id,
                     "source_type": "local",
                     "path": path,
                     "filename": Path(path).name,
@@ -1293,23 +1766,23 @@ async def import_photos(request: ImportPhotosRequest, background_tasks: Backgrou
                 imported_count += 1
                 current_index += 1
         
-        elif request.source_type == "drive":
+        elif body.source_type == "drive":
             # Import from Google Drive
-            if not request.drive_folder_id:
+            if not body.drive_folder_id:
                 raise HTTPException(status_code=400, detail="Drive folder ID required")
             
             # Extract folder ID from URL if needed
-            folder_id = extract_drive_folder_id(request.drive_folder_id)
+            folder_id = extract_drive_folder_id(body.drive_folder_id)
             if not folder_id:
                 raise HTTPException(status_code=400, detail="Invalid Google Drive folder ID or URL")
             
-            logger.info(f"Drive import - raw input: '{request.drive_folder_id}', extracted folder_id: '{folder_id}'")
+            logger.info(f"Drive import - raw input: '{body.drive_folder_id}', extracted folder_id: '{folder_id}'")
             
             # Try public access first
-            drive_service = GoogleDriveService(access_token=request.drive_access_token)
+            drive_service = GoogleDriveService(access_token=body.drive_access_token)
             
             # If no access token provided, check if folder is public
-            if not request.drive_access_token:
+            if not body.drive_access_token:
                 is_public = drive_service.is_folder_public(folder_id)
                 if not is_public:
                     raise HTTPException(
@@ -1354,7 +1827,7 @@ async def import_photos(request: ImportPhotosRequest, background_tasks: Backgrou
             
             # Get current max index
             max_photo = await db.photos.find_one(
-                {"room_id": request.room_id},
+                {"room_id": body.room_id},
                 sort=[("index", -1)]
             )
             current_index = max_photo["index"] + 1 if max_photo else 0
@@ -1373,7 +1846,7 @@ async def import_photos(request: ImportPhotosRequest, background_tasks: Backgrou
                     continue  # Skip files that fail
                 
                 photo_dict = {
-                    "room_id": request.room_id,
+                    "room_id": body.room_id,
                     "source_type": "drive",
                     "drive_id": file['id'],
                     "drive_thumbnail_url": file.get('thumbnail_url', ''),
@@ -1405,8 +1878,8 @@ async def import_photos(request: ImportPhotosRequest, background_tasks: Backgrou
                 asyncio.create_task(
                     process_drive_photos_background(
                         job_id=job_id,
-                        room_id=request.room_id,
-                        access_token=request.drive_access_token,
+                        room_id=body.room_id,
+                        access_token=body.drive_access_token,
                         remaining_files=remaining_files,
                         start_index=current_index,
                         already_processed=imported_count,
@@ -1433,8 +1906,8 @@ async def import_photos(request: ImportPhotosRequest, background_tasks: Backgrou
             }}
         )
         
-        photos_cache.invalidate_prefix(f"photos:{request.room_id}:")
-        rankings_cache.invalidate(f"rankings:{request.room_id}")
+        photos_cache.invalidate_prefix(f"photos:{body.room_id}:")
+        rankings_cache.invalidate(f"rankings:{body.room_id}")
         
         return {
             "job_id": job_id,
@@ -1571,17 +2044,18 @@ async def get_photo_base64(photo_id: str, high_quality: bool = False):
 # ==================== VOTING ROUTES ====================
 
 @api_router.post("/votes")
-async def create_vote(request: VoteRequest):
+@limiter.limit("100/minute")
+async def create_vote(body: VoteRequest, request: Request):
     """Submit a vote for a photo"""
     # Validate score
-    if request.score not in [-3, -2, -1, 1, 2, 3]:
+    if body.score not in [-3, -2, -1, 1, 2, 3]:
         raise HTTPException(status_code=400, detail="Invalid score. Must be -3, -2, -1, 1, 2, or 3")
     
     # Check if user already voted on this photo
     existing_vote = await db.votes.find_one({
-        "room_id": request.room_id,
-        "photo_id": request.photo_id,
-        "user_id": request.user_id
+        "room_id": body.room_id,
+        "photo_id": body.photo_id,
+        "user_id": body.user_id
     })
     
     if existing_vote:
@@ -1589,31 +2063,31 @@ async def create_vote(request: VoteRequest):
         await db.votes.update_one(
             {"_id": existing_vote["_id"]},
             {"$set": {
-                "score": request.score,
+                "score": body.score,
                 "timestamp": datetime.utcnow()
             }}
         )
-        rankings_cache.invalidate(f"rankings:{request.room_id}")
+        rankings_cache.invalidate(f"rankings:{body.room_id}")
         return {"message": "Vote updated"}
     else:
         # Create new vote
         vote_dict = {
-            "room_id": request.room_id,
-            "photo_id": request.photo_id,
-            "user_id": request.user_id,
-            "score": request.score,
+            "room_id": body.room_id,
+            "photo_id": body.photo_id,
+            "user_id": body.user_id,
+            "score": body.score,
             "timestamp": datetime.utcnow()
         }
         await db.votes.insert_one(vote_dict)
-        rankings_cache.invalidate(f"rankings:{request.room_id}")
+        rankings_cache.invalidate(f"rankings:{body.room_id}")
         return {"message": "Vote created"}
 
 
 @api_router.post("/votes/undo")
-async def undo_vote(request: UndoVoteRequest):
+async def undo_vote(body: UndoVoteRequest):
     """Undo the last vote by a user in a room"""
     # Get the last vote
-    votes = await get_user_votes_in_room(request.room_id, request.user_id)
+    votes = await get_user_votes_in_room(body.room_id, body.user_id)
     
     if not votes:
         raise HTTPException(status_code=404, detail="No votes to undo")
@@ -1623,7 +2097,7 @@ async def undo_vote(request: UndoVoteRequest):
     # Delete the vote
     await db.votes.delete_one({"_id": last_vote["_id"]})
     
-    rankings_cache.invalidate(f"rankings:{request.room_id}")
+    rankings_cache.invalidate(f"rankings:{body.room_id}")
     
     return {
         "message": "Vote undone",
@@ -1675,30 +2149,34 @@ async def get_rankings(room_id: str):
 # ==================== EXPORT ROUTES ====================
 
 @api_router.post("/export")
-async def export_photos(request: ExportRequest):
+async def export_photos(body: ExportRequest, authorization: str = None):
     """Export top N photos to local folder or Google Drive"""
-    logger.info(f"Export request: room_id={request.room_id}, top_n={request.top_n}, destination_type={request.destination_type}")
+    # Check if Drive operation requires Google authentication
+    if body.destination_type == "drive":
+        await get_authenticated_user(authorization)
+    
+    logger.info(f"Export request: room_id={body.room_id}, top_n={body.top_n}, destination_type={body.destination_type}")
     
     # Get rankings
-    rankings = await calculate_photo_rankings(request.room_id)
+    rankings = await calculate_photo_rankings(body.room_id)
     
     # Get top N
-    top_photos = rankings[:request.top_n]
+    top_photos = rankings[:body.top_n]
     
     if not top_photos:
         raise HTTPException(status_code=400, detail="No photos to export")
     
     # Determine destination path based on type
     destination_path = (
-        request.destination_path if request.destination_type == "local"
-        else request.drive_folder_id
+        body.destination_path if body.destination_type == "local"
+        else body.drive_folder_id
     )
     
     # Create export job
     job_dict = {
-        "room_id": request.room_id,
-        "top_n": request.top_n,
-        "destination_type": request.destination_type,
+        "room_id": body.room_id,
+        "top_n": body.top_n,
+        "destination_type": body.destination_type,
         "destination_path": destination_path,
         "status": "processing",
         "created_at": datetime.utcnow()
@@ -1707,12 +2185,12 @@ async def export_photos(request: ExportRequest):
     job_id = str(job_result.inserted_id)
     
     try:
-        if request.destination_type == "local":
+        if body.destination_type == "local":
             # Export to local folder
-            if not request.destination_path:
+            if not body.destination_path:
                 raise HTTPException(status_code=400, detail="Destination path required for local export")
             
-            export_folder = Path(request.destination_path)
+            export_folder = Path(body.destination_path)
             
             # Check if path exists and is writable
             if not export_folder.exists():
@@ -1727,7 +2205,7 @@ async def export_photos(request: ExportRequest):
             if not os.access(export_folder, os.W_OK):
                 raise HTTPException(
                     status_code=403,
-                    detail=f"No write permission for path: {request.destination_path}"
+                    detail=f"No write permission for path: {body.destination_path}"
                 )
             
             # Export photos
@@ -1769,22 +2247,22 @@ async def export_photos(request: ExportRequest):
                 "message": f"Exported {exported_count} photos to {export_folder}"
             }
         
-        elif request.destination_type == "drive":
+        elif body.destination_type == "drive":
             # Export to Google Drive
-            if not request.drive_access_token:
+            if not body.drive_access_token:
                 raise HTTPException(
                     status_code=401,
                     detail="Google Drive access token required. Please sign in with Google."
                 )
             
-            if not request.drive_folder_id:
+            if not body.drive_folder_id:
                 raise HTTPException(
                     status_code=400,
                     detail="Google Drive folder ID required"
                 )
             
             # Extract folder ID from URL if needed
-            folder_id = extract_drive_folder_id(request.drive_folder_id)
+            folder_id = extract_drive_folder_id(body.drive_folder_id)
             if not folder_id:
                 raise HTTPException(
                     status_code=400,
@@ -1795,7 +2273,7 @@ async def export_photos(request: ExportRequest):
                 from googleapiclient.http import MediaIoBaseUpload
                 
                 # Initialize Drive service with user token
-                credentials = Credentials(token=request.drive_access_token)
+                credentials = Credentials(token=body.drive_access_token)
                 drive_service = build('drive', 'v3', credentials=credentials)
                 
                 # Create export folder: vow_select_YYYYMMDD_HHMMSS
@@ -1961,12 +2439,28 @@ async def get_export_job(job_id: str):
 # Include the router in the main app
 app.include_router(api_router)
 
+# Add security headers middleware
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    # Don't add HSTS in development, only in production with HTTPS
+    # response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return response
+
+# CORS middleware with restricted origins
+print(f"🔧 Setting up CORS middleware with origins: {ALLOWED_ORIGINS}", flush=True)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
 )
 
 

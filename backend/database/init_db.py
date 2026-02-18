@@ -75,16 +75,40 @@ class DatabaseInitializer:
             validator={
                 "$jsonSchema": {
                     "bsonType": "object",
-                    "required": ["username", "created_at"],
+                    "required": ["username", "created_at", "is_guest"],
                     "properties": {
                         "_id": {"bsonType": "objectId"},
                         "username": {
                             "bsonType": "string",
-                            "description": "Guest username"
+                            "description": "Username (guest) or display name (Google user)"
+                        },
+                        "is_guest": {
+                            "bsonType": "bool",
+                            "description": "Whether this is a guest user or Google-authenticated user"
+                        },
+                        "google_id": {
+                            "bsonType": "string",
+                            "description": "Google user ID (for authenticated users)"
+                        },
+                        "email": {
+                            "bsonType": "string",
+                            "description": "Email address (for authenticated users)"
+                        },
+                        "display_name": {
+                            "bsonType": "string",
+                            "description": "Full display name from Google (for authenticated users)"
+                        },
+                        "profile_picture": {
+                            "bsonType": "string",
+                            "description": "Profile picture URL from Google (for authenticated users)"
                         },
                         "created_at": {
                             "bsonType": "date",
                             "description": "Account creation timestamp"
+                        },
+                        "last_login": {
+                            "bsonType": "date",
+                            "description": "Last login timestamp (for authenticated users)"
                         }
                     }
                 }
@@ -92,6 +116,8 @@ class DatabaseInitializer:
         )
         
         await self.db['users'].create_index("username", unique=True)
+        await self.db['users'].create_index("google_id", unique=True, sparse=True)
+        await self.db['users'].create_index("email", sparse=True)
         logger.info("✓ 'users' collection created with indexes")
     
     async def create_rooms_collection(self):
@@ -109,6 +135,10 @@ class DatabaseInitializer:
                         "code": {
                             "bsonType": "string",
                             "description": "5-digit room code"
+                        },
+                        "name": {
+                            "bsonType": "string",
+                            "description": "Room name (optional)"
                         },
                         "creator_id": {
                             "bsonType": "string",
