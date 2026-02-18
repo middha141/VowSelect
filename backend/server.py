@@ -20,6 +20,7 @@ import asyncio
 import zipfile
 from PIL import Image
 from bson import ObjectId
+from pymongo.errors import DuplicateKeyError
 import time
 
 # ==================== IN-MEMORY CACHE ====================
@@ -93,13 +94,32 @@ DRIVE_BATCH_SIZE = int(os.environ.get('DRIVE_BATCH_SIZE', '10'))
 logger_init = logging.getLogger(__name__)
 logger_init.info(f"Drive batch size: {DRIVE_BATCH_SIZE}")
 
-print(f"MongoDB URL: {mongo_url}")
+# Avoid logging full connection string in production
 print(f"Database name: {db_name}")
 client = None
 db = None
 
+# Frontend URL for CORS (default allows all for local dev)
+FRONTEND_URL = os.environ.get('FRONTEND_URL', '*')
+
 # Create the main app
 app = FastAPI(title="VowSelect API")
+
+# Build allowed origins list
+cors_origins = ["*"] if FRONTEND_URL == "*" else [
+    FRONTEND_URL,
+    "http://localhost:8081",
+    "http://localhost:19006",
+]
+
+# Add CORS middleware (MUST be added before routes)
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True if FRONTEND_URL != "*" else False,
+    allow_origins=cors_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -694,13 +714,20 @@ async def create_user(request: CreateUserRequest):
     """Create a guest user"""
     user_dict = {
         "username": request.username,
-        "created_at": datetime.utcnow()
+        "created_at": datetime.utcnow(),
+        "is_guest": True
     }
     
-    result = await db.users.insert_one(user_dict)
-    user_dict["_id"] = str(result.inserted_id)
-    
-    return User(**user_dict)
+    try:
+        result = await db.users.insert_one(user_dict)
+        user_dict["_id"] = str(result.inserted_id)
+        
+        return User(**user_dict)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Username '{request.username}' already exists. Please choose a different username."
+        )
 
 
 @api_router.get("/users/{user_id}", response_model=User)
@@ -1961,14 +1988,6 @@ async def get_export_job(job_id: str):
 # Include the router in the main app
 app.include_router(api_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 @app.on_event("startup")
 async def startup_db_client():
@@ -1976,22 +1995,32 @@ async def startup_db_client():
     logger.info(f"Connecting to MongoDB Atlas...")
     print(f"Connecting to MongoDB Atlas...", flush=True)
     try:
-        print(f"MongoDB URL: {mongo_url}", flush=True)
+        print(f"MongoDB URL: {mongo_url[:20]}...", flush=True)
         print(f"Database name: {db_name}", flush=True)
         
-        # Create SSL context for Windows compatibility
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+        is_railway = os.environ.get('RAILWAY_ENVIRONMENT') is not None
         
-        client = AsyncIOMotorClient(
-            mongo_url,
-            server_api=ServerApi('1'),
-            serverSelectionTimeoutMS=30000,
-            tls=True,
-            tlsAllowInvalidCertificates=True,
-            tlsAllowInvalidHostnames=True
-        )
+        if is_railway:
+            # Railway (Linux) - standard TLS works fine
+            client = AsyncIOMotorClient(
+                mongo_url,
+                server_api=ServerApi('1'),
+                serverSelectionTimeoutMS=30000,
+            )
+        else:
+            # Local/Windows - needs SSL workarounds
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
+            
+            client = AsyncIOMotorClient(
+                mongo_url,
+                server_api=ServerApi('1'),
+                serverSelectionTimeoutMS=30000,
+                tls=True,
+                tlsAllowInvalidCertificates=True,
+                tlsAllowInvalidHostnames=True
+            )
         print(f"Client created", flush=True)
         # Verify connection
         await client.admin.command('ping')
