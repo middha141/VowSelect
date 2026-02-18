@@ -68,6 +68,11 @@ export const getPhoto = async (photoId: string) => {
   return response.data;
 };
 
+export const getPhotoBase64 = async (photoId: string) => {
+  const response = await api.get(`/photos/${photoId}/base64`);
+  return response.data;
+};
+
 // Vote APIs
 export const createVote = async (data: {
   room_id: string;
@@ -92,6 +97,12 @@ export const getUserVotes = async (roomId: string, userId: string) => {
 // Ranking APIs
 export const getRankings = async (roomId: string) => {
   const response = await api.get(`/rankings/${roomId}`);
+  return response.data;
+};
+
+// Import Job Status (for polling progress)
+export const getImportJobStatus = async (jobId: string) => {
+  const response = await api.get(`/import-jobs/${jobId}`);
   return response.data;
 };
 

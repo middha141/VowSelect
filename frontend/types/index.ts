@@ -27,10 +27,12 @@ export interface Photo {
   id?: string;
   _id?: string;
   room_id: string;
-  source_type: 'local' | 'drive';
+  source_type: 'local' | 'drive' | 'upload';
   path?: string;
   drive_id?: string;
   drive_thumbnail_url?: string;
+  compressed_data?: string;
+  compressed_size_kb?: number;
   filename: string;
   index: number;
   created_at?: string;
@@ -49,10 +51,12 @@ export interface Vote {
 export interface PhotoRanking {
   photo_id: string;
   filename: string;
-  source_type: 'local' | 'drive';
+  source_type: 'local' | 'drive' | 'upload';
   path?: string;
   drive_id?: string;
   drive_thumbnail_url?: string;
+  compressed_data?: string;
+  compressed_size_kb?: number;
   weighted_score: number;
   vote_count: number;
   rank: number;
