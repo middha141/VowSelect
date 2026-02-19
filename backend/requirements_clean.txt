@@ -1,6 +1,6 @@
 fastapi==0.110.1
 uvicorn==0.25.0
-motor==3.3.1
+motor==3.5.7
 pymongo==4.5.0
 python-dotenv==1.2.1
 google-auth==2.49.0.dev0
