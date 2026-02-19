@@ -20,6 +20,7 @@ export default function Index() {
   const [currentUser, setCurrentUser] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [showUsernameInput, setShowUsernameInput] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
 
   useEffect(() => {
     loadUser();
@@ -39,8 +40,9 @@ export default function Index() {
   };
 
   const handleSetUsername = async () => {
+    setErrorMessage('');
     if (!username.trim()) {
-      Alert.alert('Error', 'Please enter a username');
+      setErrorMessage('Please enter a username');
       return;
     }
 
@@ -50,9 +52,14 @@ export default function Index() {
       await saveCurrentUser(user._id || user.id, user.username);
       setCurrentUser({ userId: user._id || user.id, username: user.username });
       setShowUsernameInput(false);
-      Alert.alert('Success', `Welcome, ${user.username}!`);
+      setErrorMessage('');
+      if (Platform.OS !== 'web') {
+        Alert.alert('Success', `Welcome, ${user.username}!`);
+      }
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to create user');
+      const msg = error.response?.data?.detail || error.message || 'Failed to create user';
+      setErrorMessage(msg);
+      Alert.alert('Error', msg);
     } finally {
       setLoading(false);
     }
@@ -68,9 +75,23 @@ export default function Index() {
       setLoading(true);
       const room = await createRoom(currentUser.userId);
       await saveCurrentRoom(room.room_id, room.code);
+      if (Platform.OS === 'web') {
+        window.alert(`Your room code is: ${room.code}\n\nShare this code with others so they can join!`);
+      } else {
+        Alert.alert(
+          'Room Created!',
+          `Your room code is: ${room.code}\n\nShare this code with others so they can join.`,
+          [{ text: 'OK', onPress: () => router.push(`/room/${room.room_id}`) }]
+        );
+        return;
+      }
       router.push(`/room/${room.room_id}`);
     } catch (error: any) {
-      Alert.alert('Error', error.message || 'Failed to create room');
+      if (Platform.OS === 'web') {
+        window.alert(error.message || 'Failed to create room');
+      } else {
+        Alert.alert('Error', error.message || 'Failed to create room');
+      }
     } finally {
       setLoading(false);
     }
@@ -110,13 +131,17 @@ export default function Index() {
           <Text style={styles.subtitle}>Set Your Username</Text>
 
           <TextInput
-            style={styles.input}
+            style={[styles.input, errorMessage ? styles.inputError : null]}
             placeholder="Enter your name"
             value={username}
-            onChangeText={setUsername}
+            onChangeText={(text) => { setUsername(text); setErrorMessage(''); }}
             autoCapitalize="words"
             placeholderTextColor="#999"
           />
+
+          {errorMessage ? (
+            <Text style={styles.errorText}>{errorMessage}</Text>
+          ) : null}
 
           <TouchableOpacity
             style={[styles.button, loading && styles.buttonDisabled]}
@@ -288,5 +313,14 @@ const styles = StyleSheet.create({
     color: '#D946B2',
     fontSize: 14,
     fontWeight: '600',
+  },
+  errorText: {
+    color: '#EF4444',
+    fontSize: 14,
+    marginBottom: 12,
+    textAlign: 'center',
+  },
+  inputError: {
+    borderColor: '#EF4444',
   },
 });
