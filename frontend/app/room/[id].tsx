@@ -167,7 +167,7 @@ export default function RoomScreen() {
       }
 
       const participantsData = await getRoomParticipants(roomId as string);
-      setParticipants(participantsData.participants);
+      setParticipants(participantsData?.participants || []);
     } catch (error: any) {
       Alert.alert('Error', error.message || 'Failed to load room');
     } finally {
@@ -293,105 +293,88 @@ export default function RoomScreen() {
   const handleGoogleSignIn = async () => {
     console.log('=== handleGoogleSignIn START ===');
     
-    try {
-      console.log('Step 1: Fetching auth URL from backend...');
+    const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || 'http://localhost:8001';
+
+    if (typeof window !== 'undefined' && window.open) {
+      // Web environment — open popup directly to the backend redirect endpoint.
+      // This avoids about:blank which browsers close immediately.
+      const authWindow = window.open(
+        `${backendUrl}/api/auth/google/redirect`,
+        'Google Sign In',
+        'width=500,height=600'
+      );
       
-      const backendUrl = process.env.EXPO_PUBLIC_BACKEND_URL || 'http://localhost:8001';
-      const response = await fetch(`${backendUrl}/api/auth/google`);
-      console.log('Step 2: Response status:', response.status);
-      
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error('Backend error response:', errorText);
-        Alert.alert('Backend Error', `Server returned ${response.status}: ${errorText.substring(0, 100)}`);
+      if (!authWindow) {
+        Alert.alert('Popup Blocked', 'Please allow popups for this site to sign in with Google');
         return;
       }
       
-      const data = await response.json();
-      console.log('Step 3: Auth data received:', JSON.stringify(data).substring(0, 100));
+      console.log('Popup opened, waiting for postMessage from callback...');
       
-      if (!data.auth_url) {
-        Alert.alert('Configuration Error', 'No auth URL received from backend');
-        return;
-      }
-      
-      console.log('Step 4: Opening OAuth URL...');
-      
-      // For React Native/Expo: Use WebBrowser to open OAuth URL
-      if (typeof window !== 'undefined' && window.open) {
-        // Web environment
-        const authWindow = window.open(data.auth_url, 'Google Sign In', 'width=500,height=600');
-        
-        if (!authWindow) {
-          Alert.alert('Popup Blocked', 'Please allow popups for this site to sign in with Google');
-          return;
-        }
-        
-        console.log('Step 5: Waiting for postMessage from callback window...');
-        
-        // Listen for message from callback window
-        const messageHandler = (event: MessageEvent) => {
-          console.log('Step 6: Message received:', event.data);
-          
-          if (event.data && event.data.type === 'google_auth_success' && event.data.token) {
-            console.log('Step 7: Token received via postMessage!');
-            window.removeEventListener('message', messageHandler);
-            if (!authWindow.closed) {
-              authWindow.close();
-            }
-            setDriveAccessToken(event.data.token);
-            Alert.alert(
-              'Success',
-              'Signed in with Google! You can now import photos from Google Drive.'
-            );
-          }
-        };
-        
-        window.addEventListener('message', messageHandler);
-        
-        setTimeout(() => {
+      // Listen for message from callback window
+      const messageHandler = (event: MessageEvent) => {
+        if (event.data && event.data.type === 'google_auth_success' && event.data.token) {
+          console.log('Token received via postMessage!');
           window.removeEventListener('message', messageHandler);
           if (!authWindow.closed) {
             authWindow.close();
           }
-        }, 5 * 60 * 1000);
-      } else {
-        // React Native environment - use openAuthSessionAsync for OAuth
-        console.log('Step 5: Using WebBrowser.openAuthSessionAsync for React Native...');
+          setDriveAccessToken(event.data.token);
+          AsyncStorage.setItem('driveAccessToken', event.data.token);
+          Alert.alert(
+            'Success',
+            'Signed in with Google! You can now import photos from Google Drive.'
+          );
+        }
+      };
+      
+      window.addEventListener('message', messageHandler);
+      
+      // Clean up after 5 minutes
+      setTimeout(() => {
+        window.removeEventListener('message', messageHandler);
+        if (!authWindow.closed) {
+          authWindow.close();
+        }
+      }, 5 * 60 * 1000);
+    } else {
+      // React Native environment - fetch auth URL then use WebBrowser
+      try {
+        const response = await fetch(`${backendUrl}/api/auth/google`);
+        if (!response.ok) {
+          Alert.alert('Backend Error', `Server returned ${response.status}`);
+          return;
+        }
+        const data = await response.json();
+        if (!data.auth_url) {
+          Alert.alert('Configuration Error', 'No auth URL received from backend');
+          return;
+        }
+        
         const redirectUrl = 'vowselect://auth-callback';
         const result = await WebBrowser.openAuthSessionAsync(data.auth_url, redirectUrl);
-        console.log('Step 6: Auth session result:', JSON.stringify(result));
         
         if (result.type === 'success' && result.url) {
-          // Extract token from the redirect URL
           const urlParams = new URL(result.url);
           const token = urlParams.searchParams.get('token');
           
           if (token) {
-            console.log('Step 7: Token received from redirect!');
             setDriveAccessToken(token);
             await AsyncStorage.setItem('driveAccessToken', token);
             Alert.alert('Success', 'Signed in with Google! You can now import photos from Google Drive.');
           } else {
-            console.log('No token in redirect URL:', result.url);
-            // Token might have been saved by auth-callback screen via deep link
             await loadDriveToken();
           }
         } else if (result.type === 'cancel' || result.type === 'dismiss') {
-          console.log('Auth session was cancelled/dismissed');
-          // Check if token arrived via deep link handler
           await loadDriveToken();
         }
+      } catch (error: any) {
+        console.error('Google sign-in error:', error.message);
+        Alert.alert(
+          'Sign-in Error',
+          `Failed to sign in with Google.\n\nError: ${error.message}`
+        );
       }
-    } catch (error: any) {
-      console.error('=== ERROR in handleGoogleSignIn ===');
-      console.error('Error type:', error.constructor.name);
-      console.error('Error message:', error.message);
-      console.error('Error stack:', error.stack);
-      Alert.alert(
-        'Sign-in Error',
-        `Failed to sign in with Google.\n\nError: ${error.message}\n\nMake sure:\n1. Backend server is running\n2. Backend URL is correct\n3. Popups are allowed`
-      );
     }
     
     console.log('=== handleGoogleSignIn END ===');
@@ -443,9 +426,9 @@ export default function RoomScreen() {
       </View>
 
       <View style={styles.section}>
-        <Text style={styles.sectionTitle}>👥 Participants ({participants.length})</Text>
+        <Text style={styles.sectionTitle}>👥 Participants ({(participants || []).length})</Text>
         <View style={styles.participantsList}>
-          {participants.map((p, idx) => (
+          {(participants || []).map((p, idx) => (
             <View key={idx} style={styles.participantItem}>
               <Text style={styles.participantName}>{p.username}</Text>
             </View>
