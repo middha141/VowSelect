@@ -2016,6 +2016,14 @@ async def get_export_job(job_id: str):
     return job
 
 
+# ==================== HEALTH CHECK ====================
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for Railway and monitoring."""
+    return {"status": "ok"}
+
+
 # Include the router in the main app
 app.include_router(api_router)
 
